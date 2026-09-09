@@ -1,0 +1,74 @@
+menu "LDN Wi-Fi probe"
+
+config LDN_PROBE_CHANNEL
+    int "2.4 GHz channel"
+    range 1 14
+    default 1
+    help
+        Channel used by the Switch LDN session. ESP32-C6 only supports 2.4 GHz.
+
+config LDN_PROBE_STATUS_LED
+    bool "Breathe the onboard WS2812 as a status light"
+    default y
+    help
+        White while booting, slow blue while waiting for the host, fast amber
+        while joining a room, green when the room is authenticated, and fast
+        red on join failure for a few seconds. Requires an ESP-IDF network
+        connection on the first build to fetch espressif/led_strip.
+
+config LDN_PROBE_STATUS_LED_GPIO
+    int "Status WS2812 data GPIO"
+    range 0 30
+    default 8
+    depends on LDN_PROBE_STATUS_LED
+    help
+        ESP32-C6 dev boards wire the onboard RGB LED to GPIO8.
+
+config LDN_PROBE_SEND_TEST_ACTION
+    bool "Send one harmless vendor action frame"
+    depends on !LDN_PROBE_PRIVATE_JOIN
+    default n
+    help
+        Sends one broadcast vendor-specific action frame when the public
+        receive probe starts. Use another sniffer to verify that it is on air.
+
+config LDN_PROBE_EXPORT_ADVERTISEMENTS
+    bool "Export encrypted advertisement samples over the console"
+    default n
+    help
+        Exports at most one complete Nintendo broadcast sample per statistics
+        interval. Session metadata in these samples should remain local.
+
+config LDN_PROBE_PRIVATE_JOIN
+    bool "Enable experimental private-API CCMP join"
+    default n
+    help
+        Replaces selected internal WPA callbacks, installs a pre-derived LDN
+        CCMP key after association, and calls esp_wifi_auth_done_internal().
+        The serial bridge uses ESP-IDF v6.1 on ESP32-C6 with UART.
+        Configure rooms at runtime with LDN_CONFIG; no build-time keys.
+
+if LDN_PROBE_PRIVATE_JOIN
+
+config LDN_PROBE_CONTROL_PORT
+    bool "Bridge LDN authentication frames over UART"
+    depends on ESP_CONSOLE_UART_DEFAULT
+    default n
+
+config LDN_PROBE_LEGACY_PHY
+    bool "Use 802.11b/g only for control-frame compatibility diagnostics"
+    default n
+
+config LDN_PROBE_PRIVATE_RAW_TX
+    bool "Enable pinned private software-CCMP raw TX adapter (C6/S3)"
+    depends on LDN_PROBE_CONTROL_PORT && (IDF_TARGET_ESP32C6 || IDF_TARGET_ESP32S3)
+    default n
+
+config LDN_PROBE_FRESH_MAC
+    bool "Use a fresh local STA MAC on each boot for replay-state diagnostics"
+    depends on LDN_PROBE_PRIVATE_RAW_TX
+    default n
+
+endif
+
+endmenu
