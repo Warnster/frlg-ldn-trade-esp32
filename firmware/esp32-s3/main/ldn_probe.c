@@ -21,7 +21,10 @@
 #include "nvs_flash.h"
 #include "ldn_led.h"
 #if CONFIG_LDN_PROBE_CONTROL_PORT
+#include "ldn_brain.h"
 #include "ldn_control.h"
+#include "ldn_pico.h"
+#include "gba_spi.h"   /* experimental single-chip GBA-direct SPI-slave front-end (CONFIG_GBA_SPI_*) */
 #include "ldn_session.h"
 #include "ldn_udp.h"
 #include "ldn_wire.h"
@@ -35,6 +38,16 @@ static esp_netif_t *s_station_netif;
 
 #if CONFIG_LDN_PROBE_PRIVATE_JOIN
 #include "ldn_private_wifi.h"
+#include "ldn_advert.h"
+#include "ldn_auth.h"
+#include "ldn_keys.h"
+
+/* FRLG's built-in LDN passphrase (pokeldn GBA_APP_PASSPHRASE), 64 bytes. */
+static const uint8_t GBA_APP_PASSPHRASE[64] = {
+    0xfc,0xb6,0xf6,0xad,0xb9,0xdf,0xea,0x66,0xac,0xa9,0xc3,0x26,0x14,0x9d,0x2b,0x3b,
+    0x08,0xa7,0x81,0x89,0x5c,0xbf,0x78,0xf7,0x20,0xd7,0x8b,0x85,0xa5,0x75,0x84,0xa9,
+    0x96,0x65,0xd2,0x37,0x79,0x7b,0x2a,0x41,0xdd,0xef,0x14,0x06,0x3e,0xc2,0x8d,0x25,
+    0x91,0x43,0xaf,0x78,0x32,0xfb,0x3c,0xbc,0xf2,0x75,0x9c,0xbf,0xbd,0xc8,0x1d,0x8c };
 
 #if !CONFIG_LDN_PROBE_CONTROL_PORT || !CONFIG_LDN_PROBE_EXPORT_ADVERTISEMENTS
 #error "Private join requires the dynamic serial profile; build with probe.ps1 -Mode serial"
@@ -296,6 +309,24 @@ static uint8_t s_ccmp_key[16];
 static uint8_t s_station_mac[6];
 static bool s_association_seen;
 static char s_ssid[33];
+static uint8_t s_ssid_bytes[16];
+static bool s_ssid_bytes_valid;
+static bool s_keys_installed;
+/* On-chip auto-config: scan -> derive (embedded prod.keys) -> join -> resolve IPs -> start brain. */
+/* AUTO_ARMED sits between "confirmed the Switch is here" and "actually joined it": the peer is
+ * advertised to the GBA and we WAIT for the player to select it (GBA Connect 0x1f) before EMU joins
+ * the real Switch. This matches the real union-room flow (list -> select -> join) and stops EMU from
+ * knocking on the Switch before the GBA has picked the room. */
+typedef enum { AUTO_OFF, AUTO_SCAN, AUTO_ARMED, AUTO_JOINING, AUTO_AUTH, AUTO_GETIP, AUTO_RUN } auto_state_t;
+static auto_state_t s_auto;
+/* Derived join config, captured in AUTO_SCAN and applied in AUTO_ARMED once the GBA selects us. */
+static char s_armed_ssid[33], s_armed_ccmp[33], s_armed_bssid[18];
+static unsigned s_armed_ch;
+static bool s_target_confirmed;          /* a real Switch advert has been derived -> advertise the peer */
+static uint32_t s_connect_baseline;      /* ldn_pico_connect_count() when we entered AUTO_ARMED */
+static int64_t s_auth_time;
+static int s_auth_attempts;
+static volatile bool s_reset_requested;
 static int64_t s_join_started;
 static bool s_joining;
 
@@ -468,6 +499,16 @@ static bool read_key_back(int expected_index, enum ldn_key_flag flag,
 
 static void install_ldn_keys(void)
 {
+    /* S3 ORDER (from easyworld's board-verified S3 trade): the S3 driver only finalizes the
+       station context / CAM key slots once the handshake is reported done, so authorize BEFORE
+       injecting the keys. The C6 used the opposite order — inheriting it left the group key in a
+       slot that could not decrypt the host's (broadcast) Pia frames, so RX stayed empty. */
+    const bool authorized = esp_wifi_auth_done_internal();
+    ESP_LOGI(TAG, "esp_wifi_auth_done_internal: %s", authorized ? "true" : "false");
+#if CONFIG_LDN_PROBE_CONTROL_PORT
+    printf("LDN_DIAG auth_done=%d\n", authorized);
+#endif
+
     /* The pinned blob copies eight RSC bytes even for a six-byte CCMP PN. */
     uint8_t sequence[8] = {0};
     const enum ldn_key_flag pairwise_flags =
@@ -482,30 +523,19 @@ static void install_ldn_keys(void)
         sizeof(sequence), s_ccmp_key, sizeof(s_ccmp_key), group_flags);
 
     ESP_LOGI(TAG, "key install: pairwise=%d group=%d", pairwise, group);
-    /* The pinned C6 getter rejects non-GROUP flags unconditionally. */
-    ESP_LOGW(TAG, "pairwise key readback unavailable; encrypted traffic must verify it");
+    /* Readback cannot verify keys on the S3 (the CAM stores them obfuscated); diagnostic only. */
     const bool group_ok = read_key_back(1, LDN_KEY_FLAG_GROUP, s_ccmp_key);
 #if CONFIG_LDN_PROBE_CONTROL_PORT
     printf("LDN_DIAG key_install pairwise=%d group=%d group_readback=%d\n",
            pairwise, group, group_ok);
 #endif
-    /* The install return codes are authoritative; the group readback uses the blob's
-       getter, which differs on the S3 (the C6 getter's non-GROUP quirk). Treat the
-       readback as advisory here: bail only on an actual install failure, then let
-       encrypted RX prove the key. */
+    (void)group_ok;
     if (pairwise != 0 || group != 0) {
         ESP_LOGE(TAG, "CCMP key injection failed; not authorizing port");
         ldn_led_set(LDN_LED_ERROR);
         return;
     }
-    (void)group_ok;
-
-    const bool authorized = esp_wifi_auth_done_internal();
-    ESP_LOGI(TAG, "esp_wifi_auth_done_internal: %s",
-             authorized ? "true" : "false");
-#if CONFIG_LDN_PROBE_CONTROL_PORT
-    printf("LDN_DIAG auth_done=%d\n", authorized);
-#endif
+    s_keys_installed = true;
     ldn_led_set(LDN_LED_LINKED);
 }
 
@@ -532,11 +562,27 @@ static void wifi_event(void *argument, esp_event_base_t base, int32_t id,
 #if CONFIG_LDN_PROBE_CONTROL_PORT
         printf("LDN_DIAG sta_disconnected reason=%u\n", event->reason);
         ldn_control_link(false);
+        /* Link dropped — stop the brain and re-scan from scratch (the room may reappear on a
+         * different channel). The heavy reset (esp_wifi_stop/start) runs in the loop, not here. */
+        if (s_auto != AUTO_OFF) { ldn_brain_stop(); s_auto = AUTO_SCAN; s_reset_requested = true; }
 #endif
     }
 }
 
 const char *ldn_session_ssid(void) { return s_ssid[0] ? s_ssid : "-"; }
+
+int ldn_session_ssid_bytes(uint8_t out[16])
+{
+    if (!s_ssid_bytes_valid) return -1;
+    memcpy(out, s_ssid_bytes, 16);
+    return 0;
+}
+
+void ldn_session_identity(uint8_t our_mac[6], uint8_t host_mac[6])
+{
+    memcpy(our_mac, s_station_mac, 6);
+    memcpy(host_mac, s_target_bssid, 6);
+}
 
 void ldn_session_stop(void)
 {
@@ -548,6 +594,8 @@ void ldn_session_stop(void)
     s_association_seen = false;
     memset(s_ccmp_key, 0, sizeof(s_ccmp_key));
     memset(s_ssid, 0, sizeof(s_ssid));
+    s_ssid_bytes_valid = false;
+    s_keys_installed = false;
     memset(s_target_bssid, 0, sizeof(s_target_bssid));
     ldn_control_target(s_target_bssid);
     esp_wifi_start();
@@ -573,6 +621,7 @@ esp_err_t ldn_session_configure(const char *ssid, const char *bssid, const char 
         return ESP_ERR_INVALID_ARG;
     ldn_session_stop();
     memcpy(s_ssid, ssid, 33);
+    memcpy(s_ssid_bytes, ssid_bytes, 16); s_ssid_bytes_valid = true;
     memcpy(s_target_bssid, host, 6); memcpy(s_ccmp_key, secret, 16);
     memset(secret, 0, sizeof(secret));
     /* A new station identity avoids reusing a CCMP replay context on reconnect. */
@@ -604,17 +653,242 @@ esp_err_t ldn_session_configure(const char *ssid, const char *bssid, const char 
     return result;
 }
 
+/* Snapshot the most recent captured LDN advertisement (thread-safe). Returns length or 0. */
+static size_t auto_snapshot_advert(uint8_t *frame, size_t cap, uint8_t src[6], uint8_t *channel)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    size_t len = s_advertisement.length;
+    if (len > cap) len = 0;
+    if (len) {
+        memcpy(frame, s_advertisement.body, len);
+        memcpy(src, s_advertisement.source, 6);
+        *channel = s_advertisement.channel;
+    }
+    portEXIT_CRITICAL(&s_stats_lock);
+    return len;
+}
+
+/* Derive the join config from the captured advertisement using the embedded prod.keys.
+ * ssid + CCMP key from AES-GCM decrypt; bssid + channel from the captured frame header. 0 on ok. */
+static int auto_derive(uint8_t ssid[16], uint8_t ccmp[16], uint8_t bssid[6], unsigned *channel)
+{
+    uint8_t frame[1536], src[6], chan, pt[512];
+    size_t len = auto_snapshot_advert(frame, sizeof(frame), src, &chan);
+    if (len == 0) return -1;
+    long ptl = ldn_advert_decrypt(&LDN_KEYS, frame, len, pt);   /* pt[0:16] = server_random */
+    if (ptl < 16) return -1;
+    if (ldn_advert_ssid(frame, len, ssid) != 0) return -1;
+    if (ldn_derive_data_key(&LDN_KEYS, pt, 16, GBA_APP_PASSPHRASE, sizeof(GBA_APP_PASSPHRASE), ccmp) != 0)
+        return -1;
+    memcpy(bssid, src, 6);
+    *channel = chan;
+    return 0;
+}
+
+/* After join the host re-advertises with us listed; parse the V2 participant list for our IP + the
+ * host's IP/MAC. 0 when both are resolved. */
+static int auto_get_ips(const uint8_t our_mac[6], uint8_t our_ip[4], uint8_t host_ip[4],
+                        uint8_t host_mac[6])
+{
+    uint8_t frame[1536], src[6], chan, pt[512];
+    size_t len = auto_snapshot_advert(frame, sizeof(frame), src, &chan);
+    if (len == 0) return -1;
+    long ptl = ldn_advert_decrypt(&LDN_KEYS, frame, len, pt);
+    if (ptl < 40) return -1;
+    int num = pt[39];                       /* V2: num_participants at offset 39 */
+    int found_us = 0, found_host = 0;
+    for (int i = 0; i < num; ++i) {         /* each entry: ip(4) mac(6) index(1) plat(1) name(32) pad(4) */
+        size_t off = 40 + 48 * (size_t)i;
+        if (off + 48 > (size_t)ptl) break;
+        const uint8_t *ip = pt + off, *mac = pt + off + 4;
+        uint8_t index = pt[off + 10];
+        int zero_ip = !(ip[0] | ip[1] | ip[2] | ip[3]);
+        if (index == 0 && !zero_ip) { memcpy(host_ip, ip, 4); memcpy(host_mac, mac, 6); found_host = 1; }
+        if (memcmp(mac, our_mac, 6) == 0 && !zero_ip) { memcpy(our_ip, ip, 4); found_us = 1; }
+    }
+    return (found_us && found_host) ? 0 : -1;
+}
+
+/* Build + send the LDN AuthenticationFrame that registers us as a participant (so the host assigns
+ * our IP). Fields come from the room advertisement + the embedded prod.keys. 0 on TX ok. */
+static int auto_send_auth(void)
+{
+    uint8_t frame[1536], src[6], chan, pt[512];
+    size_t len = auto_snapshot_advert(frame, sizeof(frame), src, &chan);
+    if (len < 45) return -1;
+    long ptl = ldn_advert_decrypt(&LDN_KEYS, frame, len, pt);
+    if (ptl < 24) return -1;
+    uint8_t ssid[16];
+    if (ldn_advert_ssid(frame, len, ssid) != 0) return -1;
+    uint64_t comm_id = ldn_advert_local_comm_id(frame, len);
+    uint16_t scene = (uint16_t)((frame[22] << 8) | frame[23]);   /* advert NetworkId is big-endian */
+    int version = frame[44];
+    uint8_t server_random[16]; memcpy(server_random, pt, 16);
+    uint64_t token = 0; for (int i = 0; i < 8; i++) token = (token << 8) | pt[16 + i];  /* BE64 */
+    uint8_t client_random[16]; esp_fill_random(client_random, sizeof(client_random));
+    uint64_t nonce = 0; esp_fill_random(&nonce, sizeof(nonce));
+    uint8_t authf[1024];
+    int n = ldn_build_auth_frame(&LDN_KEYS, 3, version, comm_id, scene, ssid, server_random,
+                                 client_random, token, nonce, "EMU", 88, authf, sizeof(authf));
+    if (n < 0) return -1;
+    int r = ldn_control_tx_ldn(authf, n);
+    printf("LDN_AUTO auth_tx v=%d len=%d result=%d\n", version, n, r);
+    return r == 0 ? 0 : -1;
+}
+
+void ldn_session_auto_start(void)
+{
+    if (s_auto == AUTO_OFF) { s_auto = AUTO_SCAN; printf("LDN_AUTO scanning\n"); }
+}
+
+/* One step of the standalone auto-config state machine. Called from run_private_join. */
+static void auto_poll(void)
+{
+    if (s_auto == AUTO_SCAN) {
+        uint8_t ssid[16], ccmp[16], bssid[6]; unsigned ch = 0;
+        /* Hop 1/6/11 until the room's advertisement is heard (LDN rooms aren't always on ch1). */
+        static const uint8_t chans[3] = {1, 6, 11};
+        static int hop_i = 0; static int64_t hop_t = 0;
+        int64_t hnow = esp_timer_get_time();
+        if (hop_t == 0) { esp_wifi_set_channel(chans[0], WIFI_SECOND_CHAN_NONE); hop_t = hnow; }
+        else if (hnow - hop_t > 1200000) {
+            hop_i = (hop_i + 1) % 3;
+            esp_wifi_set_channel(chans[hop_i], WIFI_SECOND_CHAN_NONE);
+            hop_t = hnow;
+            printf("LDN_AUTO scan ch=%u\n", chans[hop_i]);
+        }
+        if (auto_derive(ssid, ccmp, bssid, &ch) == 0 && ch >= 1 && ch <= 11) {
+            static const char d[] = "0123456789abcdef";
+            for (int i = 0; i < 16; ++i) { s_armed_ssid[2*i]=d[ssid[i]>>4]; s_armed_ssid[2*i+1]=d[ssid[i]&15];
+                                           s_armed_ccmp[2*i]=d[ccmp[i]>>4]; s_armed_ccmp[2*i+1]=d[ccmp[i]&15]; }
+            s_armed_ssid[32] = s_armed_ccmp[32] = 0;
+            snprintf(s_armed_bssid, sizeof(s_armed_bssid), MACSTR, MAC2STR(bssid));
+            s_armed_ch = ch;
+            /* Lock onto the Switch's channel + start advertising the peer, but DON'T join yet.
+             * Wait for the GBA to select us (Connect 0x1f) — the real union-room "list -> pick". */
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+            s_target_confirmed = true;
+            s_connect_baseline = ldn_pico_connect_count();
+            s_auto = AUTO_ARMED;
+            printf("LDN_AUTO armed ch=%u (Switch found; peer advertised, awaiting GBA select)\n", ch);
+        }
+    } else if (s_auto == AUTO_ARMED) {
+        /* The peer is in the GBA's Join-Group list (advertised from the main loop). Join the Switch
+         * ONLY when the player picks it — a new Connect (0x1f) forwarded by the Pico. */
+        if (ldn_pico_connect_count() != s_connect_baseline) {
+            esp_err_t r = ldn_session_configure(s_armed_ssid, s_armed_bssid, s_armed_ccmp, s_armed_ch);
+            printf("LDN_AUTO gba-selected -> configure ch=%u result=%d\n", s_armed_ch, (int)r);
+            if (r == ESP_OK) s_auto = AUTO_JOINING;   /* else retry: fall back and re-arm on next advert */
+            else { s_auto = AUTO_SCAN; s_target_confirmed = false; }
+        }
+    } else if (s_auto == AUTO_JOINING) {
+        if (s_keys_installed) {
+            s_auth_attempts = 0;
+            s_auto = AUTO_AUTH;
+            printf("LDN_AUTO joined; authenticating\n");
+        }
+    } else if (s_auto == AUTO_AUTH) {
+        /* Register as an LDN participant so the host assigns our IP. */
+        auto_send_auth();
+        s_auth_time = esp_timer_get_time();
+        s_auth_attempts++;
+        s_auto = AUTO_GETIP;
+    } else if (s_auto == AUTO_GETIP) {
+        uint8_t our_ip[4], host_ip[4], host_mac[6], ssid[16];
+        if (auto_get_ips(s_station_mac, our_ip, host_ip, host_mac) == 0 &&
+            ldn_session_ssid_bytes(ssid) == 0) {
+            char line[64];
+            snprintf(line, sizeof(line), "LDN_NET %u.%u.%u.%u %u.%u.%u.%u",
+                     our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+                     host_ip[0], host_ip[1], host_ip[2], host_ip[3]);
+            ldn_udp_command(line, true);
+            snprintf(line, sizeof(line), "LDN_NEIGH %u.%u.%u.%u %02x%02x%02x%02x%02x%02x",
+                     host_ip[0], host_ip[1], host_ip[2], host_ip[3],
+                     host_mac[0], host_mac[1], host_mac[2], host_mac[3], host_mac[4], host_mac[5]);
+            ldn_udp_command(line, true);
+            ldn_brain_start(ssid, our_ip, host_ip, s_station_mac, s_target_bssid);
+            s_auto = AUTO_RUN;
+        } else if (esp_timer_get_time() - s_auth_time > 2000000) {
+            /* No participant IP yet — re-send the auth frame (bounded), else give up to SCAN. */
+            if (s_auth_attempts < 12) s_auto = AUTO_AUTH;
+            else { printf("LDN_AUTO auth gave up; rescanning\n"); s_auto = AUTO_SCAN; }
+        }
+    }
+}
+
 static void run_private_join(void)
 {
     s_probe_task = xTaskGetCurrentTaskHandle();
     ldn_led_set(LDN_LED_IDLE);
+    ldn_pico_init();
     ldn_control_init(s_station_netif, s_target_bssid);
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     int64_t last_advertisement = 0;
+    int64_t last_brain_tick = 0;
     bool diag_gate = false;
     for (;;) {
         ldn_control_poll();
         const int64_t now = esp_timer_get_time();
+        /* Drive the standalone trade brain at ~60 Hz (VBlank cadence). */
+        if (ldn_brain_active() && now - last_brain_tick >= 16667) {
+            last_brain_tick = now;
+            ldn_brain_tick();
+        }
+        if (s_reset_requested) {   /* link dropped: clean up the session, then AUTO_SCAN re-finds it */
+            s_reset_requested = false;
+            ldn_session_stop();
+            printf("LDN_AUTO reset; re-scanning\n");
+        }
+        /* GBA-activity gate: only join the Switch while the real GBA is active in wireless mode
+         * (the Pico forwards its RFU traffic to us). No GBA -> stay out of the Switch's room. */
+        {
+            static uint32_t s_last_wap; static int64_t s_last_wap_time;
+            uint32_t st[5]; ldn_pico_stats(st);
+            if (st[0] != s_last_wap) { s_last_wap = st[0]; s_last_wap_time = now; }
+            bool gba_active = s_last_wap_time && (now - s_last_wap_time < 5000000);  /* 5s */
+            if (gba_active && s_auto == AUTO_OFF) {
+                printf("LDN_AUTO gba-active -> joining\n");
+                ldn_session_auto_start();
+            } else if (!gba_active && s_auto != AUTO_OFF) {
+                printf("LDN_AUTO gba-idle -> leaving\n");
+                ldn_brain_stop(); ldn_session_stop(); s_auto = AUTO_OFF;
+                s_target_confirmed = false;
+            }
+        }
+        if (s_auto != AUTO_OFF && s_auto != AUTO_RUN) auto_poll();
+        ldn_pico_poll();   /* drain the GBA's WAP stream continuously (FIFO relief) */
+        {   /* Advertise the peer to the GBA only once we've CONFIRMED a real Switch is present
+             * (a valid advert was derived). This puts the Switch in the GBA's Join-Group list as a
+             * selectable partner without EMU having joined yet — the player's selection (Connect 0x1f)
+             * is what drives the join. Advertising a phantom before confirmation would let the GBA
+             * pick a peer with no Switch behind it. */
+            static int64_t last_peer_adv;
+            if (s_target_confirmed && now - last_peer_adv > 400000) {
+                last_peer_adv = now;
+                ldn_pico_advertise_peer();
+            }
+            /* standalone Pico-link status (visible even when EMU is not joined) */
+            static int64_t last_pico_print;
+            if (now - last_pico_print > 2000000) {
+                last_pico_print = now;
+                uint32_t st[5]; ldn_pico_stats(st);
+                printf("PICO_LINK wap=%u slots=%u taken=%u recv=%u peer=%u connect=%u armed=%d auto=%d\n",
+                       (unsigned)st[0], (unsigned)st[1], (unsigned)st[2], (unsigned)st[3],
+                       (unsigned)st[4], (unsigned)ldn_pico_connect_count(),
+                       (int)s_target_confirmed, s_auto);
+                /* What flow is the GBA in? bcastRead(1c/1d/1e)=looking-for-rooms(join);
+                 * startHost(19)/accept(1a)=hosting; connect(1f)=selected a room; send(25)=trade. */
+                printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u\n",
+                       (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
+                       (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
+                       (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
+                       (unsigned)ldn_pico_cmd_count(0x1f), (unsigned)ldn_pico_cmd_count(0x25));
+                /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
+                uint32_t pd[3]; ldn_pico_diag(pd);
+                printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",
+                       (unsigned)pd[0], (unsigned)pd[1], (unsigned)pd[2]);
+            }
+        }
         if (s_joining && s_association_seen && !diag_gate) {
             diag_gate = true;
             printf("LDN_DIAG gate assoc_seen sta_running=%d\n",
@@ -625,6 +899,7 @@ static void run_private_join(void)
         } else if (s_joining && now - s_join_started > 15000000) {
             ldn_session_stop(); printf("LDN_ERROR ASSOCIATION_TIMEOUT\n");
             ldn_led_set(LDN_LED_ERROR);
+            if (s_auto != AUTO_OFF) s_auto = AUTO_SCAN;   /* retry the whole auto sequence */
         }
         if (now - last_advertisement >= 250000) { export_advertisement(); last_advertisement = now; }
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -632,9 +907,36 @@ static void run_private_join(void)
 }
 #endif
 
+/* Standalone ESP-brain step 1: prove cport (the FRLG<->LDN trade brain) compiles, links, and
+ * runs on the S3 — AES via mbedtls + zstd via the Xtensa component. Logged at boot (plaintext,
+ * before the wire silences logs). */
+#include "aes_backend.h"
+#include "pia_zstd.h"
+static void cport_selftest(void)
+{
+    /* AES-128-ECB round trip (mbedtls backend). NIST FIPS-197 test vector. */
+    static const uint8_t key[16] = {0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
+                                    0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c};
+    static const uint8_t pt[16] = {0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+                                   0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a};
+    uint8_t ct[16], back[16];
+    int e = aes128_ecb_encrypt_block(key, pt, ct);
+    int d = aes128_ecb_decrypt_block(key, ct, back);
+    bool aes_ok = (e == 0 && d == 0 && memcmp(back, pt, 16) == 0 && ct[0] == 0x3a && ct[1] == 0xd7);
+    /* zstd round trip via pia_zstd (Xtensa zstd component). */
+    static const uint8_t blob[80] = {0};
+    uint8_t comp[160], dec[160];
+    long c = pia_compress(blob, sizeof(blob), comp, sizeof(comp));
+    long z = c > 0 ? pia_decompress(comp, (size_t)c, dec, sizeof(dec)) : -1;
+    bool zstd_ok = (z == (long)sizeof(blob) && memcmp(dec, blob, sizeof(blob)) == 0);
+    ESP_LOGW("cport", "SELFTEST aes=%s zstd=%s (c=%ld z=%ld)",
+             aes_ok ? "OK" : "FAIL", zstd_ok ? "OK" : "FAIL", c, z);
+}
+
 void app_main(void)
 {
     ldn_led_init();
+    cport_selftest();
     esp_chip_info_t chip;
     esp_chip_info(&chip);
     uint32_t flash_bytes = 0;
@@ -646,6 +948,11 @@ void app_main(void)
     ESP_LOGI(TAG, "console=USB Serial/JTAG");
 #else
     ESP_LOGI(TAG, "console=UART");
+#endif
+#if CONFIG_GBA_SPI_DIRECT_SELFTEST
+    /* Experimental single-chip path: talk to the GBA directly via the S3 SPI slave (no RP2040).
+     * Never returns — see GBA_SPI_SLAVE_DESIGN.md §8 gate 1/2. Leave the Kconfig OFF for LDN. */
+    gba_spi_selftest();
 #endif
     esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES ||

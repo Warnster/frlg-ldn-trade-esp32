@@ -14,6 +14,7 @@
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "ldn_brain.h"
 #include "ldn_control.h"
 #include "ldn_udp.h"
 #include "ldn_session.h"
@@ -168,6 +169,22 @@ static esp_err_t control_rx(void *buffer, uint16_t length, void *eb)
         esp_wifi_internal_free_rx_buffer(eb);
         return ESP_OK;
     }
+    /* DIAGNOSTIC: log the first frames handed to lwip so we can see what the Switch sends. */
+    static int dbg_n;
+    if (dbg_n < 12 && length >= 14) {
+        dbg_n++;
+        unsigned et = (bytes[12] << 8) | bytes[13];
+        if (et == 0x0800 && length >= 34) {
+            int ihl = (bytes[14] & 0x0f) * 4, proto = bytes[14 + 9];
+            unsigned dport = (length >= (unsigned)(14 + ihl + 4)) ? ((bytes[14 + ihl + 2] << 8) | bytes[14 + ihl + 3]) : 0;
+            printf("LDN_ETH ip proto=%d dst=%u.%u.%u.%u src=%u.%u.%u.%u dport=%u len=%u\n",
+                   proto, bytes[30], bytes[31], bytes[32], bytes[33], bytes[26], bytes[27], bytes[28], bytes[29],
+                   dport, length);
+        } else {
+            printf("LDN_ETH et=%04x len=%u dstmac=%02x%02x%02x%02x%02x%02x\n", et, length,
+                   bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+        }
+    }
     return esp_netif_receive(s_netif, buffer, length, eb);
 }
 
@@ -177,9 +194,9 @@ void ldn_control_init(esp_netif_t *netif, const unsigned char host[6])
     memcpy(s_host, host, 6);
     ldn_udp_init(netif, host);
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_mac));
-    s_rx = xQueueCreate(4, sizeof(control_frame_t));
+    s_rx = xQueueCreate(2, sizeof(control_frame_t));
     ESP_ERROR_CHECK(s_rx == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    s_air_rx_queue = xQueueCreate(8, sizeof(capture_frame_t));
+    s_air_rx_queue = xQueueCreate(1, sizeof(capture_frame_t));  /* diagnostic only; minimal for RAM */
     ESP_ERROR_CHECK(s_air_rx_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 #if CONFIG_LDN_PROBE_PRIVATE_RAW_TX
     ldn_tx_trace_init(s_host, s_mac);
@@ -235,7 +252,22 @@ static void command(const char *line)
             result = ldn_session_configure(ssid, bssid, key, channel);
         printf("LDN_CONFIG_RESULT %d\n", result); return;
     }
-    if (!strcmp(line, "LDN_STOP")) { ldn_session_stop(); printf("LDN_STOPPED\n"); return; }
+    if (!strcmp(line, "LDN_STOP")) { ldn_brain_stop(); ldn_session_stop(); printf("LDN_STOPPED\n"); return; }
+    if (!strcmp(line, "LDN_BRAIN")) {
+        /* Hand the trade to the on-chip brain; the PC only set up the LDN session + IPs. */
+        uint8_t ssid[16], our_ip[4], host_ip[4], our_mac[6], host_mac[6];
+        int result = -1;
+        if (ldn_session_ssid_bytes(ssid) == 0 && ldn_udp_ips(our_ip, host_ip)) {
+            ldn_session_identity(our_mac, host_mac);
+            result = ldn_brain_start(ssid, our_ip, host_ip, our_mac, host_mac);
+        }
+        printf("LDN_BRAIN_RESULT %d\n", result); return;
+    }
+    if (!strcmp(line, "LDN_BRAIN_STOP")) { ldn_brain_stop(); printf("LDN_BRAIN_STOPPED\n"); return; }
+    if (!strcmp(line, "LDN_AUTO")) {
+        /* Full standalone: scan + derive (embedded keys) + join + start the brain, no PC. */
+        ldn_session_auto_start(); printf("LDN_AUTO_OK\n"); return;
+    }
     if (strcmp(line, "LDN_QUIET") == 0) {
         atomic_store(&s_quiet, true);
         xQueueReset(s_air_rx_queue);
@@ -327,6 +359,28 @@ static void command(const char *line)
     result = esp_wifi_internal_tx(WIFI_IF_STA, frame, 14 + n / 2);
 done:
     printf("LDN_TX_RESULT %d\n", result);
+}
+
+/* Air/link RX counters (for diagnostics): host data frames heard, unicast-to-us, ACKs, ethernet-rx. */
+void ldn_control_air(uint32_t out[4])
+{
+    out[0] = atomic_load(&s_air_rx);
+    out[1] = atomic_load(&s_air_data);
+    out[2] = atomic_load(&s_air_ack);
+    out[3] = atomic_load(&s_ethernet_rx);
+}
+
+/* Send an LDN payload (e.g. an AuthenticationFrame, starting 0022aa0102) as an Ethernet-II 0x88b7
+ * data frame — the same path LDN_TX uses, callable on-chip by the standalone auto-config. */
+int ldn_control_tx_ldn(const uint8_t *payload, int len)
+{
+    static uint8_t frame[FRAME_MAX];
+    if (len <= 0 || 14 + len > FRAME_MAX || !atomic_load(&s_connected)) return ESP_ERR_INVALID_STATE;
+    memcpy(frame, s_host, 6);
+    memcpy(frame + 6, s_mac, 6);
+    frame[12] = 0x88; frame[13] = 0xb7;
+    memcpy(frame + 14, payload, (size_t)len);
+    return esp_wifi_internal_tx(WIFI_IF_STA, frame, 14 + len);
 }
 
 void ldn_control_poll(void)

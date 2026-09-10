@@ -1,0 +1,19 @@
+menu "GBA SPI-slave front-end (experimental)"
+
+config GBA_SPI_DIRECT_SELFTEST
+    bool "Run the GBA SPI-slave self-test at boot (skips LDN)"
+    default n
+    help
+        When set, app_main() runs gba_spi_selftest() (design doc §8 gate 1/2) instead of the LDN
+        join, logging the 32-bit words the GBA clocks in so the SPI mode + wiring can be confirmed.
+        Leave OFF for the normal two-chip LDN firmware.
+
+config GBA_SPI_MODE
+    int "SPI slave mode (0-3) for the GBA link"
+    default 3
+    range 0 3
+    help
+        SPI CPOL/CPHA for the GBA link. Start at 3 (design doc §2); if login words read bit-shifted
+        or garbled, try 0. This is the first go/no-go dial.
+
+endmenu

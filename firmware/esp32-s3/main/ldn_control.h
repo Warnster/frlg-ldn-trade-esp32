@@ -10,6 +10,8 @@ typedef struct {
 } ldn_hw_metadata_t;
 
 void ldn_control_init(esp_netif_t *netif, const unsigned char host[6]);
+int  ldn_control_tx_ldn(const uint8_t *payload, int len);
+void ldn_control_air(uint32_t out[4]);   /* {air_rx, air_data(unicast), air_ack, ethernet_rx} */
 void ldn_control_link(bool connected);
 void ldn_control_poll(void);
 void ldn_control_sniff(const unsigned char *frame, size_t length);

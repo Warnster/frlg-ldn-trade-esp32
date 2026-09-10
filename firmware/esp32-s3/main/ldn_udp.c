@@ -11,6 +11,7 @@
 #include "lwip/tcpip.h"
 #include "ldn_udp.h"
 #include "ldn_wire.h"
+#include "ldn_brain.h"
 #define printf ldn_wire_printf
 
 #if !ETHARP_SUPPORT_STATIC_ENTRIES
@@ -118,6 +119,27 @@ failed:
     return ESP_FAIL;
 }
 
+/* Direct C send used by the standalone brain (sim's transport callback). dst_ip = 4 octets. */
+void ldn_udp_send(const uint8_t dst_ip[4], const uint8_t *data, int len)
+{
+    if (s_socket < 0 || len <= 0 || len > PAYLOAD_MAX) return;
+    struct sockaddr_in dest = {.sin_family = AF_INET, .sin_port = htons(PIA_PORT)};
+    memcpy(&dest.sin_addr.s_addr, dst_ip, 4);   /* octets are already network order */
+    if (sendto(s_socket, data, len, 0, (struct sockaddr *)&dest, sizeof(dest)) == len) ++s_tx;
+    else ++s_rejected;
+}
+
+/* Report the session IPs (octets) to the brain: our static IP + the first known peer. */
+bool ldn_udp_ips(uint8_t our_ip[4], uint8_t host_ip[4])
+{
+    if (!s_ip.addr) return false;
+    memcpy(our_ip, &s_ip.addr, 4);
+    for (int i = 0; i < PEERS_MAX; ++i) {
+        if (s_peers[i].addr) { memcpy(host_ip, &s_peers[i].addr, 4); return true; }
+    }
+    return false;
+}
+
 static int from_hex(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -197,7 +219,9 @@ tx_done:
 void ldn_udp_poll(bool connected)
 {
     if (s_socket < 0) return;
-    if (!connected || esp_timer_get_time() - s_heartbeat > 10000000) {
+    /* The serial host used to keep this alive with LDN_PING; the standalone brain has no PC, so the
+     * heartbeat timeout only applies when the brain is NOT driving. */
+    if (!connected || (!ldn_brain_active() && esp_timer_get_time() - s_heartbeat > 10000000)) {
         ldn_udp_stop();
         esp_wifi_disconnect();
         printf("LDN_NET_LOST\n");
@@ -217,10 +241,20 @@ void ldn_udp_poll(bool connected)
         }
         bool known = false;
         for (int i = 0; i < PEERS_MAX; ++i) known |= s_peers[i].addr == source.sin_addr.s_addr;
+        static int dbg; if (dbg < 12) { dbg++;
+            uint8_t *ip = (uint8_t *)&source.sin_addr.s_addr;
+            printf("LDN_UDP_RX n=%d from=%u.%u.%u.%u:%u known=%d\n", n, ip[0], ip[1], ip[2], ip[3],
+                   ntohs(source.sin_port), known); }
         if (n > PAYLOAD_MAX || source.sin_port != htons(PIA_PORT) || !known) { ++s_rejected; continue; }
+        ++s_rx;
+        /* Standalone brain owns the trade: feed the datagram to sim.c instead of the serial. */
+        if (ldn_brain_active()) {
+            uint8_t src[4]; memcpy(src, &source.sin_addr.s_addr, 4);
+            ldn_brain_on_datagram(src, bytes, n);
+            continue;
+        }
         for (int i = 0; i < n; ++i) { hex[2 * i] = digits[bytes[i] >> 4]; hex[2 * i + 1] = digits[bytes[i] & 15]; }
         hex[n * 2] = 0;
-        ++s_rx;
         printf("LDN_DATAGRAM %s %s\n", inet_ntoa(source.sin_addr), hex);
     }
 }
