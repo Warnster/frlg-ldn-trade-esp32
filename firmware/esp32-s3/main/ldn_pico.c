@@ -56,6 +56,7 @@ void ldn_pico_set_peer_identity(uint16_t tid, const uint8_t name8[8])
 /* Two-chip path: the GBA's 0x16 identity isn't decoded from the UART stream yet — fall back to the
  * default join name. (Single-chip ldn_gba.c decodes it via gba_relay.) */
 bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8]) { (void)tid; (void)name8; return false; }
+void ldn_pico_gba_bcast_dbg(uint32_t out6[6], uint32_t *seen) { for (int i=0;i<6;i++) out6[i]=0; if (seen) *seen=0; }
 /* Same GBA beacon build + checksum as the single-chip path (see ldn_gba.c build_gba_beacon). */
 static void build_gba_beacon(uint16_t tid, const uint8_t name8[8], uint32_t beacon6[6])
 {

@@ -332,6 +332,16 @@ static int s_auth_attempts;
 static volatile bool s_reset_requested;
 static int64_t s_join_started;
 static bool s_joining;
+/* Channel-retry for the GBA-committed join (2026-09-11): the Switch's advert is heard on different
+ * channels across runs, so the arm-time channel can be wrong by the time the player selects. Once
+ * committed (Connect fired), if an association attempt fails (STA_DISCONNECTED before keys install),
+ * cycle 1/6/11 and retry until one lands or the deadline passes — instead of the wrong channel
+ * silently never reaching the Switch. */
+static bool s_join_committed;
+static volatile bool s_join_retry;
+static int64_t s_join_deadline;
+static int s_join_ch_idx;
+static const uint8_t s_join_chans[3] = {1, 6, 11};
 
 static void remember_association(const uint8_t *frame, size_t length)
 {
@@ -567,7 +577,13 @@ static void wifi_event(void *argument, esp_event_base_t base, int32_t id,
         ldn_control_link(false);
         /* Link dropped — stop the brain and re-scan from scratch (the room may reappear on a
          * different channel). The heavy reset (esp_wifi_stop/start) runs in the loop, not here. */
-        if (s_auto != AUTO_OFF) { ldn_brain_stop(); s_auto = AUTO_SCAN; s_reset_requested = true; }
+        if (s_join_committed && !s_keys_installed) {
+            /* Association attempt failed on this channel (e.g. NO_AP_FOUND: the Switch is on another
+             * of 1/6/11). Don't drop the GBA's commit — just retry the next channel (AUTO_JOINING). */
+            s_join_retry = true;
+        } else if (s_auto != AUTO_OFF) {
+            ldn_brain_stop(); s_auto = AUTO_SCAN; s_reset_requested = true;
+        }
 #endif
     }
 }
@@ -590,6 +606,7 @@ void ldn_session_identity(uint8_t our_mac[6], uint8_t host_mac[6])
 void ldn_session_stop(void)
 {
     s_joining = false;
+    s_join_committed = false; s_join_retry = false;   /* any teardown ends a committed join */
     ldn_udp_stop();
     esp_wifi_disconnect();
     /* Stop the driver before replacing key material or accepting another room. */
@@ -745,7 +762,13 @@ static void gba_joiner_name(char out[10])
     uint16_t tid; uint8_t nm[8]; char a[9];
     if (ldn_pico_get_gba_identity(&tid, nm)) {
         frlg_name_ascii(nm, a);
-        if (a[0]) { strncpy(out, a, 9); out[9] = 0; return; }
+        /* Only use it if it decoded to a real name — the GBA's 0x16 broadcast turned out NOT to
+         * carry the trainer name (bytes there aren't FRLG-charmap letters -> '?'), so reject any
+         * '?'/empty result and fall back to EMU rather than show garbage on the Switch. The real
+         * GBA name has to come from the NI game-data instead (TODO). */
+        int ok = a[0] != 0;
+        for (const char *p = a; *p; ++p) if (*p == '?') { ok = 0; break; }
+        if (ok) { strncpy(out, a, 9); out[9] = 0; return; }
     }
     strcpy(out, "EMU");
 }
@@ -819,6 +842,13 @@ static int auto_send_auth(void)
     uint8_t client_random[16]; esp_fill_random(client_random, sizeof(client_random));
     uint64_t nonce = 0; esp_fill_random(&nonce, sizeof(nonce));
     char jn[10]; gba_joiner_name(jn);   /* the GBA player's real name, not "EMU" */
+    {   /* diagnostic: why is the joiner name what it is? show capture state + raw 0x16 layout */
+        uint16_t dtid = 0; uint8_t dnm[8]; int dvalid = ldn_pico_get_gba_identity(&dtid, dnm);
+        uint32_t bw[6], bseen = 0; ldn_pico_gba_bcast_dbg(bw, &bseen);
+        printf("LDN_AUTO joiner='%s' gba_id_valid=%d tid=0x%04x bcast_seen=%u raw=%08x %08x %08x %08x %08x %08x\n",
+               jn, dvalid, (unsigned)dtid, (unsigned)bseen,
+               (unsigned)bw[0], (unsigned)bw[1], (unsigned)bw[2], (unsigned)bw[3], (unsigned)bw[4], (unsigned)bw[5]);
+    }
     uint8_t authf[1024];
     int n = ldn_build_auth_frame(&LDN_KEYS, 3, version, comm_id, scene, ssid, server_random,
                                  client_random, token, nonce, jn, 88, authf, sizeof(authf));
@@ -884,16 +914,32 @@ static void auto_poll(void)
         /* The peer is in the GBA's Join-Group list (advertised from the main loop). Join the Switch
          * ONLY when the player picks it — a new Connect (0x1f) forwarded by the Pico. */
         if (ldn_pico_connect_count() != s_connect_baseline) {
+            s_join_committed = true; s_join_retry = false;
+            s_join_deadline = esp_timer_get_time() + 25000000;   /* 25s to land the association */
+            /* try the armed channel first, then cycle the other two */
+            s_join_ch_idx = (s_armed_ch == 6) ? 1 : (s_armed_ch == 11) ? 2 : 0;
             esp_err_t r = ldn_session_configure(s_armed_ssid, s_armed_bssid, s_armed_ccmp, s_armed_ch);
             printf("LDN_AUTO gba-selected -> configure ch=%u result=%d\n", s_armed_ch, (int)r);
-            if (r == ESP_OK) s_auto = AUTO_JOINING;   /* else retry: fall back and re-arm on next advert */
-            else { s_auto = AUTO_SCAN; s_target_confirmed = false; }
+            s_auto = AUTO_JOINING;                     /* stay committed; retry path owns channel cycling */
+            if (r != ESP_OK) s_join_retry = true;
         }
     } else if (s_auto == AUTO_JOINING) {
         if (s_keys_installed) {
+            s_join_committed = false;                  /* associated — stop cycling channels */
             s_auth_attempts = 0;
             s_auto = AUTO_AUTH;
             printf("LDN_AUTO joined; authenticating\n");
+        } else if (s_join_retry) {
+            s_join_retry = false;
+            if (esp_timer_get_time() > s_join_deadline) {
+                printf("LDN_AUTO join: no channel associated in time -> rescanning\n");
+                s_join_committed = false; s_target_confirmed = false; s_auto = AUTO_SCAN;
+            } else {
+                unsigned ch = s_join_chans[s_join_ch_idx % 3]; s_join_ch_idx++;
+                esp_err_t r = ldn_session_configure(s_armed_ssid, s_armed_bssid, s_armed_ccmp, ch);
+                printf("LDN_AUTO join retry ch=%u result=%d\n", ch, (int)r);
+                if (r != ESP_OK) s_join_retry = true;  /* couldn't start — advance again next tick */
+            }
         }
     } else if (s_auto == AUTO_AUTH) {
         /* Register as an LDN participant so the host assigns our IP. */
@@ -959,7 +1005,12 @@ static void run_private_join(void)
             if (gba_active && s_auto == AUTO_OFF) {
                 printf("LDN_AUTO gba-active -> joining\n");
                 ldn_session_auto_start();
-            } else if (!gba_active && (s_auto == AUTO_SCAN || s_auto == AUTO_ARMED)) {
+            } else if (!gba_active && s_auto == AUTO_SCAN) {
+                /* Only abandon on a brief idle while still SCANNING. Once ARMED (a trade partner is
+                 * shown to the GBA) we stay sticky through the browse pauses — the player takes time
+                 * to pick, and the old 5s rule kept dropping ARMED so the Connect landed in an
+                 * un-armed window and the join never triggered. ARMED/JOINING+ are torn down only by
+                 * the 30s "truly gone" path below (or a real link drop). */
                 /* GBA went quiet BEFORE committing to a join — abandon and wait for it to come back. */
                 printf("LDN_AUTO gba-idle -> leaving\n");
                 ldn_brain_stop(); ldn_session_stop(); s_auto = AUTO_OFF;
@@ -1001,11 +1052,16 @@ static void run_private_join(void)
                        (int)s_target_confirmed, s_auto);
                 /* What flow is the GBA in? bcastRead(1c/1d/1e)=looking-for-rooms(join);
                  * startHost(19)/accept(1a)=hosting; connect(1f)=selected a room; send(25)=trade. */
-                printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u\n",
+                printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u"
+                       " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x\n",
                        (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
                        (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
                        (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
-                       (unsigned)ldn_pico_cmd_count(0x1f), (unsigned)ldn_pico_cmd_count(0x25));
+                       (unsigned)ldn_pico_cmd_count(0x1f), (unsigned)ldn_pico_cmd_count(0x25),
+                       (unsigned)ldn_pico_cmd_count(0x20), (unsigned)ldn_pico_cmd_count(0x21),
+                       (unsigned)ldn_pico_cmd_count(0x26), (unsigned)ldn_pico_cmd_count(0x27),
+                       (unsigned)ldn_pico_cmd_count(0x28), (unsigned)ldn_pico_cmd_count(0x35),
+                       (unsigned)g_gba_last_cmd);
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);
                 printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",
@@ -1019,7 +1075,9 @@ static void run_private_join(void)
         }
         if (s_joining && s_association_seen && esp_wifi_sta_is_running_internal()) {
             s_joining = false; install_ldn_keys();
-        } else if (s_joining && now - s_join_started > 15000000) {
+        } else if (s_joining && !s_join_committed && now - s_join_started > 15000000) {
+            /* Backstop only for a non-committed join; a GBA-committed join is governed by the
+             * channel-retry + 25s deadline in AUTO_JOINING (don't let this fight it). */
             ldn_session_stop(); printf("LDN_ERROR ASSOCIATION_TIMEOUT\n");
             ldn_led_set(LDN_LED_ERROR);
             if (s_auto != AUTO_OFF) s_auto = AUTO_SCAN;   /* retry the whole auto sequence */

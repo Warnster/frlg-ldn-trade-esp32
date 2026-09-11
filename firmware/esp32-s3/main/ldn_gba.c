@@ -144,6 +144,14 @@ bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8])
     return gba_relay_get_gba_identity(tid, name8);
 }
 
+void ldn_pico_gba_bcast_dbg(uint32_t out6[6], uint32_t *seen)
+{
+    gba_relay_room_info_t ri;
+    gba_relay_get_room_info(&ri);
+    for (int i = 0; i < 6; i++) out6[i] = ri.broadcast_raw[i];
+    if (seen) *seen = ri.broadcast_seen;
+}
+
 /* No separate relay chip to report back — the two-chip PICO_RX diagnostic is not meaningful here.
  * Surface the room-info decode instead (setup/broadcast generation counts) so the line still has
  * signal: {broadcast_seen, setup_seen, peer_present-ish}. */

@@ -16,6 +16,7 @@
 #include "ldn_udp.h"
 #include "ldn_wire.h"
 #include "sim.h"
+#include "ni.h"   /* NI_LANGUAGE_JAPANESE for the cartridge identity below */
 #include "crypto.h"
 #define printf ldn_wire_printf
 
@@ -80,6 +81,22 @@ int ldn_brain_start(const uint8_t ssid[16], const uint8_t our_ip[4], const uint8
     memset(&s_engine, 0, sizeof(s_engine));
     s_engine.tick = eng_tick;
     s_engine.feed_in_frame = eng_feed;
+    /* Identity we present to the Switch as the joining player: the REAL cartridge's trainer id +
+     * name, taken from its own Broadcast(0x16) as RAW FRLG-charmap bytes. Raw (not ASCII) because
+     * this cart is Japanese — its name is kana (としあき = 14 0c 01 07), which the ASCII charmap
+     * cannot encode. Falls back to the built-in default if the GBA hasn't broadcast yet. */
+    {
+        uint16_t gtid = 0; uint8_t gname8[8];
+        if (ldn_pico_get_gba_identity(&gtid, gname8)) {
+            s_engine.lp_trainer_id = gtid;
+            memcpy(s_engine.lp_name_raw, gname8, 8);
+            s_engine.lp_name_raw_valid = 1;
+            s_engine.lp_language = NI_LANGUAGE_JAPANESE;
+            printf("LDN_BRAIN identity tid=0x%04x name_raw=%02x%02x%02x%02x%02x%02x%02x%02x (JP, raw)\n",
+                   gtid, gname8[0], gname8[1], gname8[2], gname8[3],
+                   gname8[4], gname8[5], gname8[6], gname8[7]);
+        }
+    }
     s_engine.in_seat_phase = 0;
     s_engine.established = 0;
     s_engine.ni_started = 1;

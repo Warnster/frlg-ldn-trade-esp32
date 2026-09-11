@@ -32,6 +32,9 @@ void ldn_pico_set_peer_identity(uint16_t tid, const uint8_t name8[8]);
  * Broadcast(0x16). Returns false until the GBA has broadcast it. Used to present the GBA player's
  * real name to the Switch instead of the hardcoded "EMU". */
 bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8]);
+/* DIAGNOSTIC: the GBA's last Broadcast(0x16) raw data words + how many broadcasts have been seen,
+ * so we can inspect the on-wire RfuGameData layout when the decoded name looks wrong. */
+void ldn_pico_gba_bcast_dbg(uint32_t out6[6], uint32_t *seen);
 void ldn_pico_stats(uint32_t out[5]);  /* {wap_seen, slots_seen(0x25), slots_taken, recv_slots_sent, peer_sent} */
 /* Number of Connect (0x1f) commands the GBA has issued. Increments when the player selects our
  * advertised peer — the signal to actually join the Switch (not merely that the GBA is active). */
