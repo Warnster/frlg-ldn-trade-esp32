@@ -40,6 +40,11 @@ static inline bool    gba_wap_is_response(uint8_t cmd) { return (cmd & 0x80) != 
 /* GBA command IDs (routes.rs) */
 enum {
     GBA_CMD_UNKNOWN         = 0x11,
+    /* ID_SLOT_STATUS_REQ. librfu's watchLink does `num_packets = packet[1] - 1` on the reply
+     * (librfu_rfu.c:1054-1067): a ZERO-word ack underflows that to 255 and walks ~1KB past the
+     * 116-byte rx buffer. Only reachable in MODE_PARENT so it is dormant for us today, but it is
+     * the same class as the CP_POLL bug — answered explicitly with one word so it can never fire. */
+    GBA_CMD_SLOT_STATUS     = 0x14,
     GBA_CMD_GET_SOME_VALUE  = 0x13,
     GBA_CMD_BROADCAST       = 0x16,
     /* Setup's data[0] high-mid byte (bits 16-23) is the join/host ROLE byte: 0x3c=join, 0x3f=host
@@ -56,6 +61,11 @@ enum {
     GBA_CMD_SEND_DATA_WAIT  = 0x25,
     GBA_CMD_RECV_DATA       = 0x26,
     GBA_CMD_RECV_DATA_WAIT  = 0x27,
+    /* MISNOMER, kept for source compatibility. librfu.h:84 says 0x28 = ID_DATA_READY_AND_CHANGE_REQ
+     * and 0x29 = ID_DISCONNECTED_AND_CHANGE_REQ, and BOTH are IDs the ADAPTER raises to the GBA via
+     * the MSC callback — they are not commands the GBA sends to us, so this arm should never fire.
+     * (Inherited from the RP2040 port's naming.) If it ever does fire on real hardware that is
+     * itself a finding: it would mean our framing is off, not that the GBA wants a slot. */
     GBA_CMD_RECV_DATA_WAIT_RESP = 0x28,
     /* Real Nintendo agbrfu low-level REQ IDs (librfu.h), the "_AND_CHANGE" family: an ack to any of
      * these triggers an SIO clock master/slave role swap, which our transport fakes via ASYNC_ACK
