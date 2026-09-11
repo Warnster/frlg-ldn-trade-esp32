@@ -8,3 +8,4 @@
 /app/
 *.log
 prod.keys
+firmware/esp32-s3/components/gba_spi/build/

@@ -1,5 +1,13 @@
+# GBA transport: single-chip on-chip relay (ldn_gba.c, core1<->core0 shared SRAM) OR the two-chip
+# Pico UART bridge (ldn_pico.c). Mutually exclusive — both export the same ldn_pico_* symbols.
+if(CONFIG_LDN_GBA_SINGLE_CHIP)
+    set(gba_transport_src "ldn_gba.c")
+else()
+    set(gba_transport_src "ldn_pico.c")
+endif()
+
 idf_component_register(
-    SRCS "ldn_probe.c" "ldn_led.c" "ldn_control.c" "ldn_private_raw.c" "ldn_tx_trace.c" "ldn_udp.c" "ldn_wire.c" "ldn_brain.c" "ldn_pico.c"
+    SRCS "ldn_probe.c" "ldn_led.c" "ldn_control.c" "ldn_private_raw.c" "ldn_tx_trace.c" "ldn_udp.c" "ldn_wire.c" "ldn_brain.c" "${gba_transport_src}"
     INCLUDE_DIRS "."
     REQUIRES esp_event esp_netif esp_wifi esp_timer nvs_flash wpa_supplicant esp_hw_support spi_flash esp_driver_uart lwip led_strip cport gba_spi
 )

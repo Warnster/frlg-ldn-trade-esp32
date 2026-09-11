@@ -25,6 +25,9 @@
 #include "ldn_control.h"
 #include "ldn_pico.h"
 #include "gba_spi.h"   /* experimental single-chip GBA-direct SPI-slave front-end (CONFIG_GBA_SPI_*) */
+#if CONFIG_LDN_GBA_SINGLE_CHIP
+#include "gba_relay.h" /* single-chip: the core1<->core0 relay backing ldn_gba.c (docs/16 Phase 2) */
+#endif
 #include "ldn_session.h"
 #include "ldn_udp.h"
 #include "ldn_wire.h"
@@ -668,20 +671,108 @@ static size_t auto_snapshot_advert(uint8_t *frame, size_t cap, uint8_t src[6], u
     return len;
 }
 
-/* Derive the join config from the captured advertisement using the embedded prod.keys.
- * ssid + CCMP key from AES-GCM decrypt; bssid + channel from the captured frame header. 0 on ok. */
-static int auto_derive(uint8_t ssid[16], uint8_t ccmp[16], uint8_t bssid[6], unsigned *channel)
+/* ---- trade-leader detection + real host identity (2026-09-11) --------------------------------
+ * pokeldn ground truth (ldn/transport.py, ldn/beacon.py, vendor/LDN AdvertisementInfo.decode):
+ *  - The decrypted advert plaintext `pt` is AdvertisementInfo V2 (big-endian): server_random[0:16],
+ *    challenge[16:24], security_mode[24], accept_policy[25], app_version[26:28], pad[28:36],
+ *    band/chan[36:38], max_participants[38], num_participants[39], then num*48-byte participant
+ *    entries at [40], then a BE u16 app_data length, then application_data.
+ *  - application_data = a 0x5C-byte Pia system header, then a custom base85 blob that decodes
+ *    (5 chars -> 4 LE bytes; digit = c-0x23 for c<0x5C else c-0x24) to a 24-byte FRLG record:
+ *    record[0:2]=in-game TID (LE), record[2:10]=OT name (FRLG charmap, 0xFF-padded — the SAME
+ *    charmap the GBA uname uses, so it copies straight through), record[16:18]=search word (LE):
+ *    activity = word & 0x7F (ACTIVITY_TRADE=4, ACTIVITY_SEARCH=12=just standing in the union room),
+ *    started = word & 0x8000.
+ *  This is the ONLY pre-join view of the host's game state — the real trainer name/TID are here,
+ *  NOT in the "Lewis"-style LDN participant username (that's a different, console-level name). */
+#define FRLG_HOST_COMM_ID   0x01006fa0233f8000ULL   /* FRLG title id, HOST role (joiner=0x0100610011000000) */
+#define LDN_ACCEPT_NONE     1
+#define GBA_ACTIVITY_TRADE  4
+#define LDN_PIA_HDR_LEN     0x5C
+
+/* Decode the 24-byte FRLG game-state record out of the decrypted advert plaintext. 0 on success. */
+static int auto_decode_beacon(const uint8_t *pt, int ptl, uint16_t *tid, uint8_t name8[8],
+                              uint8_t *activity, bool *started)
+{
+    if (ptl < 40) return -1;
+    int num = pt[39];
+    int off = 40 + 48 * num;
+    if (off + 2 > ptl) return -1;
+    int size = (pt[off] << 8) | pt[off + 1];      /* BE u16 app_data length */
+    off += 2;
+    if (size < LDN_PIA_HDR_LEN || off + size > ptl) return -1;
+    const uint8_t *b85 = pt + off + LDN_PIA_HDR_LEN;   /* skip the Pia system header */
+    int b85len = size - LDN_PIA_HDR_LEN;
+    uint8_t rec[32]; int reclen = 0;
+    for (int i = 0; i + 5 <= b85len && reclen + 4 <= (int)sizeof(rec); i += 5) {
+        uint32_t v = 0;
+        for (int k = 4; k >= 0; k--) {             /* reversed: first char = least-significant digit */
+            uint8_t c = b85[i + k];
+            v = v * 85u + ((c < 0x5C) ? (uint32_t)(c - 0x23) : (uint32_t)(c - 0x24));
+        }
+        rec[reclen++] = v & 0xFF; rec[reclen++] = (v >> 8) & 0xFF;
+        rec[reclen++] = (v >> 16) & 0xFF; rec[reclen++] = (v >> 24) & 0xFF;
+    }
+    if (reclen < 24) return -1;
+    *tid = (uint16_t)(rec[0] | (rec[1] << 8));
+    memcpy(name8, rec + 2, 8);
+    uint16_t word = (uint16_t)(rec[16] | (rec[17] << 8));
+    *activity = (uint8_t)(word & 0x7F);
+    *started = (word & 0x8000) != 0;
+    return 0;
+}
+
+/* Render an 8-byte FRLG-charmap name to ASCII for logging only (mirrors pokeldn _frlg_name). */
+static void frlg_name_ascii(const uint8_t name8[8], char out[9])
+{
+    int n = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t x = name8[i];
+        if (x == 0xFF) break;
+        if (x >= 0xBB && x <= 0xD4) out[n++] = 'A' + (x - 0xBB);
+        else if (x >= 0xD5 && x <= 0xEE) out[n++] = 'a' + (x - 0xD5);
+        else if (x >= 0xA1 && x <= 0xAA) out[n++] = '0' + (x - 0xA1);
+        else out[n++] = (x == 0) ? ' ' : '?';
+    }
+    out[n] = 0;
+}
+
+/* The GBA player's real name (ASCII, decoded from its Broadcast 0x16) to present to the Switch as
+ * the joining trainer — replaces the hardcoded "EMU". Falls back to "EMU" if the GBA hasn't
+ * broadcast its identity yet (e.g. two-chip path, or before the first 0x16). */
+static void gba_joiner_name(char out[10])
+{
+    uint16_t tid; uint8_t nm[8]; char a[9];
+    if (ldn_pico_get_gba_identity(&tid, nm)) {
+        frlg_name_ascii(nm, a);
+        if (a[0]) { strncpy(out, a, 9); out[9] = 0; return; }
+    }
+    strcpy(out, "EMU");
+}
+
+/* Evaluate a captured advert: derive the join config AND decide whether it's a TRADE LEADER (a FRLG
+ * host with an open seat that has actually started a trade), extracting the host's real name/TID.
+ * Returns 0 = trade leader (all outs incl. name8/tid filled); 1 = a valid advert but NOT a trade
+ * leader (join config filled, identity not — do not advertise the peer); <0 = no/undecodable advert. */
+static int auto_scan_evaluate(uint8_t ssid[16], uint8_t ccmp[16], uint8_t bssid[6], unsigned *channel,
+                              uint16_t *tid, uint8_t name8[8], uint8_t *activity, bool *started)
 {
     uint8_t frame[1536], src[6], chan, pt[512];
     size_t len = auto_snapshot_advert(frame, sizeof(frame), src, &chan);
     if (len == 0) return -1;
-    long ptl = ldn_advert_decrypt(&LDN_KEYS, frame, len, pt);   /* pt[0:16] = server_random */
-    if (ptl < 16) return -1;
+    long ptl = ldn_advert_decrypt(&LDN_KEYS, frame, len, pt);
+    if (ptl < 40) return -1;
     if (ldn_advert_ssid(frame, len, ssid) != 0) return -1;
     if (ldn_derive_data_key(&LDN_KEYS, pt, 16, GBA_APP_PASSPHRASE, sizeof(GBA_APP_PASSPHRASE), ccmp) != 0)
         return -1;
     memcpy(bssid, src, 6);
     *channel = chan;
+    /* Trade-leader gate. Proven checks first (host role + open seat), then the FRLG activity. */
+    if (ldn_advert_local_comm_id(frame, len) != FRLG_HOST_COMM_ID) return 1;   /* not a FRLG host */
+    uint8_t accept = pt[25], maxp = pt[38], nump = pt[39];
+    if (accept == LDN_ACCEPT_NONE || nump >= maxp) return 1;                    /* no open seat */
+    if (auto_decode_beacon(pt, (int)ptl, tid, name8, activity, started) != 0) return 1;  /* no game state */
+    if (*activity != GBA_ACTIVITY_TRADE) return 1;                              /* union/search, not trade */
     return 0;
 }
 
@@ -727,9 +818,10 @@ static int auto_send_auth(void)
     uint64_t token = 0; for (int i = 0; i < 8; i++) token = (token << 8) | pt[16 + i];  /* BE64 */
     uint8_t client_random[16]; esp_fill_random(client_random, sizeof(client_random));
     uint64_t nonce = 0; esp_fill_random(&nonce, sizeof(nonce));
+    char jn[10]; gba_joiner_name(jn);   /* the GBA player's real name, not "EMU" */
     uint8_t authf[1024];
     int n = ldn_build_auth_frame(&LDN_KEYS, 3, version, comm_id, scene, ssid, server_random,
-                                 client_random, token, nonce, "EMU", 88, authf, sizeof(authf));
+                                 client_random, token, nonce, jn, 88, authf, sizeof(authf));
     if (n < 0) return -1;
     int r = ldn_control_tx_ldn(authf, n);
     printf("LDN_AUTO auth_tx v=%d len=%d result=%d\n", version, n, r);
@@ -757,20 +849,36 @@ static void auto_poll(void)
             hop_t = hnow;
             printf("LDN_AUTO scan ch=%u\n", chans[hop_i]);
         }
-        if (auto_derive(ssid, ccmp, bssid, &ch) == 0 && ch >= 1 && ch <= 11) {
+        uint16_t tid = 0; uint8_t name8[8] = {0}, activity = 0; bool started = false;
+        int ev = auto_scan_evaluate(ssid, ccmp, bssid, &ch, &tid, name8, &activity, &started);
+        /* Only ARM (and thus advertise the peer to the GBA) once the Switch is a TRADE LEADER —
+         * a FRLG host with an open seat that has started a trade (ev==0). A Switch merely sitting in
+         * a menu or standing in the union room (ev==1) must NOT be shown to the GBA. This is the fix
+         * for "Ash appears even when the Switch isn't leading a trade". */
+        if (ev == 0 && ch >= 1 && ch <= 11) {
             static const char d[] = "0123456789abcdef";
             for (int i = 0; i < 16; ++i) { s_armed_ssid[2*i]=d[ssid[i]>>4]; s_armed_ssid[2*i+1]=d[ssid[i]&15];
                                            s_armed_ccmp[2*i]=d[ccmp[i]>>4]; s_armed_ccmp[2*i+1]=d[ccmp[i]&15]; }
             s_armed_ssid[32] = s_armed_ccmp[32] = 0;
             snprintf(s_armed_bssid, sizeof(s_armed_bssid), MACSTR, MAC2STR(bssid));
             s_armed_ch = ch;
+            /* Present the host's REAL in-game trainer name + TID to the GBA (decoded from the advert),
+             * instead of the hardcoded "Ash"/0xc979. */
+            ldn_pico_set_peer_identity(tid, name8);
             /* Lock onto the Switch's channel + start advertising the peer, but DON'T join yet.
-             * Wait for the GBA to select us (Connect 0x1f) — the real union-room "list -> pick". */
+             * Wait for the GBA to select us (Connect 0x1f) — the real "list -> pick" flow. */
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
             s_target_confirmed = true;
             s_connect_baseline = ldn_pico_connect_count();
             s_auto = AUTO_ARMED;
-            printf("LDN_AUTO armed ch=%u (Switch found; peer advertised, awaiting GBA select)\n", ch);
+            char nm[9]; frlg_name_ascii(name8, nm);
+            printf("LDN_AUTO armed ch=%u TRADE leader name='%s' tid=0x%04x started=%d (peer advertised, awaiting GBA select)\n",
+                   ch, nm, tid, (int)started);
+        } else if (ev == 1) {
+            static int64_t last_skip; int64_t hn = esp_timer_get_time();
+            if (hn - last_skip > 3000000) { last_skip = hn;
+                printf("LDN_AUTO advert seen but NOT a trade leader (not host / no open seat / not trade) — not shown to GBA\n");
+            }
         }
     } else if (s_auto == AUTO_ARMED) {
         /* The peer is in the GBA's Join-Group list (advertised from the main loop). Join the Switch
@@ -806,7 +914,8 @@ static void auto_poll(void)
                      host_ip[0], host_ip[1], host_ip[2], host_ip[3],
                      host_mac[0], host_mac[1], host_mac[2], host_mac[3], host_mac[4], host_mac[5]);
             ldn_udp_command(line, true);
-            ldn_brain_start(ssid, our_ip, host_ip, s_station_mac, s_target_bssid);
+            char jn[10]; gba_joiner_name(jn);   /* present the GBA player's real name to the Switch */
+            ldn_brain_start(ssid, our_ip, host_ip, s_station_mac, s_target_bssid, jn);
             s_auto = AUTO_RUN;
         } else if (esp_timer_get_time() - s_auth_time > 2000000) {
             /* No participant IP yet — re-send the auth frame (bounded), else give up to SCAN. */
@@ -845,12 +954,26 @@ static void run_private_join(void)
             static uint32_t s_last_wap; static int64_t s_last_wap_time;
             uint32_t st[5]; ldn_pico_stats(st);
             if (st[0] != s_last_wap) { s_last_wap = st[0]; s_last_wap_time = now; }
-            bool gba_active = s_last_wap_time && (now - s_last_wap_time < 5000000);  /* 5s */
+            bool gba_active = s_last_wap_time && (now - s_last_wap_time < 5000000);   /* 5s: pre-commit idle */
+            bool gba_gone   = s_last_wap_time && (now - s_last_wap_time > 30000000); /* 30s: truly gone */
             if (gba_active && s_auto == AUTO_OFF) {
                 printf("LDN_AUTO gba-active -> joining\n");
                 ldn_session_auto_start();
-            } else if (!gba_active && s_auto != AUTO_OFF) {
+            } else if (!gba_active && (s_auto == AUTO_SCAN || s_auto == AUTO_ARMED)) {
+                /* GBA went quiet BEFORE committing to a join — abandon and wait for it to come back. */
                 printf("LDN_AUTO gba-idle -> leaving\n");
+                ldn_brain_stop(); ldn_session_stop(); s_auto = AUTO_OFF;
+                s_target_confirmed = false;
+            } else if (gba_gone && s_auto != AUTO_OFF) {
+                /* 2026-09-11 fix: once the GBA has SELECTED us and we're joining/authenticating/
+                 * running (AUTO_JOINING+), a brief quiet is EXPECTED — the GBA waits for the
+                 * connection + the Switch's trade data to flow back through the relay. Tearing the
+                 * session down on the old 5s rule was killing a WORKING join one step past
+                 * host_accepted (observed: NI accepted, then gba-idle -> STA_DISCONNECT reason=8).
+                 * So in committed states only give up after a much longer silence (30s) that a real
+                 * post-connect handshake never reaches; a genuine link loss still tears down
+                 * immediately via STA_DISCONNECTED -> AUTO_SCAN. */
+                printf("LDN_AUTO gba truly gone (30s) -> leaving\n");
                 ldn_brain_stop(); ldn_session_stop(); s_auto = AUTO_OFF;
                 s_target_confirmed = false;
             }
@@ -949,10 +1072,20 @@ void app_main(void)
 #else
     ESP_LOGI(TAG, "console=UART");
 #endif
+#if CONFIG_GBA_SPI_BUS_PROBE
+    /* GPIO bus-stall probe (docs/17 §7 follow-up): measures worst-case core-1 GPIO_IN_REG read
+     * stalls under staged core-0 bus load. Never returns; no GBA needed. Leave OFF normally. */
+    gba_spi_bus_probe();
+#endif
 #if CONFIG_GBA_SPI_DIRECT_SELFTEST
     /* Experimental single-chip path: talk to the GBA directly via the S3 SPI slave (no RP2040).
      * Never returns — see GBA_SPI_SLAVE_DESIGN.md §8 gate 1/2. Leave the Kconfig OFF for LDN. */
     gba_spi_selftest();
+#endif
+#if CONFIG_GBA_SPI_TRADE_RELAY_SELFTEST
+    /* docs/16-single-chip-trade-plan.md Phase 1: bare core1 GBA adapter + the real gba_relay
+     * backend + a synthetic Switch peer, no real Wi-Fi yet. Never returns. */
+    gba_spi_trade_relay_selftest();
 #endif
     esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -997,6 +1130,24 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     enable_management_sniffer();
+
+#if CONFIG_LDN_GBA_SINGLE_CHIP
+    /* Single-chip (docs/16 Phase 2): bring up the bare-metal GBA adapter on core 1 BEFORE the LDN
+     * join loop, wired to the shared-SRAM relay that ldn_gba.c serves to the brain. Same bring-up
+     * sequence proven tonight in gba_spi_trade_relay_selftest (9,278 clean Union-Room commands),
+     * minus that function's own monitor loop — run_private_join IS the core-0 loop here. Wi-Fi is
+     * already started above; UNICORE confines it (+ its ISRs) to core 0, leaving core 1 for the
+     * jitter-free bit-bang. This is the first time both run together (the one Phase-2 unknown). */
+    {
+        static gba_wap_io s_gba_io;
+        gba_spi_init();
+        gba_relay_init();
+        gba_relay_fill_io(&s_gba_io);
+        gba_spi_set_core1_io(&s_gba_io);
+        gba_core1_start();
+        ESP_LOGI(TAG, "single-chip: core1 GBA adapter up (relay-backed); LDN join on core0");
+    }
+#endif
 
 #if CONFIG_LDN_PROBE_PRIVATE_JOIN
     run_private_join();

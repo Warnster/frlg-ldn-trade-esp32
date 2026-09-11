@@ -8,6 +8,28 @@ config GBA_SPI_DIRECT_SELFTEST
         join, logging the 32-bit words the GBA clocks in so the SPI mode + wiring can be confirmed.
         Leave OFF for the normal two-chip LDN firmware.
 
+config GBA_SPI_TRADE_RELAY_SELFTEST
+    bool "Run the Phase 1 trade-relay self-test at boot (skips LDN)"
+    default n
+    help
+        When set, app_main() runs gba_spi_trade_relay_selftest() instead of the LDN join: the bare
+        core1 GBA adapter wired to the REAL gba_relay backend with a synthetic Switch peer seeded,
+        so the discover->connect->slot-exchange flow can be validated against a real cartridge in
+        the TRADE counter, without real Wi-Fi yet (docs/16-single-chip-trade-plan.md, Phase 1).
+        Mutually exclusive with GBA_SPI_DIRECT_SELFTEST in practice (both start core1). Leave OFF
+        for the normal LDN firmware.
+
+config GBA_SPI_BUS_PROBE
+    bool "Run the GPIO bus-stall probe at boot (skips LDN)"
+    default n
+    help
+        When set, app_main() runs gba_spi_bus_probe() instead of the LDN join: bare core 1 times
+        every back-to-back GPIO_IN_REG read (ccount deltas, min/max/threshold buckets) while
+        core 0 cycles 5-second load phases (quiet, UART log spam, flash-read churn, PSRAM memcpy
+        churn, all-at-once). Answers docs/17 section 7's open question on-device: can core-0 bus
+        traffic stall a core-1 GPIO read past the 250ns half-bit budget? No GBA needs to be
+        connected. Mutually exclusive with the other GBA_SPI_* selftests. Leave OFF normally.
+
 config GBA_SPI_MODE
     int "SPI slave mode (0-3) for the GBA link"
     default 3

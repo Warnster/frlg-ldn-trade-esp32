@@ -259,7 +259,7 @@ static void command(const char *line)
         int result = -1;
         if (ldn_session_ssid_bytes(ssid) == 0 && ldn_udp_ips(our_ip, host_ip)) {
             ldn_session_identity(our_mac, host_mac);
-            result = ldn_brain_start(ssid, our_ip, host_ip, our_mac, host_mac);
+            result = ldn_brain_start(ssid, our_ip, host_ip, our_mac, host_mac, NULL);  /* PC path: default name */
         }
         printf("LDN_BRAIN_RESULT %d\n", result); return;
     }

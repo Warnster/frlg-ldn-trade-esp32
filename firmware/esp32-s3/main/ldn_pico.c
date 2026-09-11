@@ -47,7 +47,38 @@ void ldn_pico_stats(uint32_t out[5]) {
     out[0]=s_wap_seen; out[1]=s_slots_seen; out[2]=s_slots_taken; out[3]=s_recv_sent; out[4]=s_peer_sent;
 }
 
-void ldn_pico_advertise_peer(void) { ldn_pico_send_peer(PEER_ID, PEER_BEACON); s_peer_sent++; }
+/* Host Switch's real in-game identity (from the LDN advert); when valid, replaces the placeholder. */
+static uint16_t s_peer_tid; static uint8_t s_peer_name[8]; static bool s_peer_id_valid;
+void ldn_pico_set_peer_identity(uint16_t tid, const uint8_t name8[8])
+{
+    s_peer_tid = tid; memcpy(s_peer_name, name8, 8); s_peer_id_valid = true;
+}
+/* Two-chip path: the GBA's 0x16 identity isn't decoded from the UART stream yet — fall back to the
+ * default join name. (Single-chip ldn_gba.c decodes it via gba_relay.) */
+bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8]) { (void)tid; (void)name8; return false; }
+/* Same GBA beacon build + checksum as the single-chip path (see ldn_gba.c build_gba_beacon). */
+static void build_gba_beacon(uint16_t tid, const uint8_t name8[8], uint32_t beacon6[6])
+{
+    uint8_t b[24] = {0};
+    b[0] = 0x02; b[1] = 0x00; b[2] = 0x82; b[3] = 0x0f;
+    b[4] = tid & 0xFF; b[5] = (tid >> 8) & 0xFF;
+    b[12] = 0x04;
+    for (int i = 0; i < 8; i++) b[16 + i] = name8[i];
+    uint8_t cs = 0;
+    for (int i = 2; i < 10; i++) cs += b[i];
+    for (int i = 16; i < 24; i++) cs += b[i];
+    b[15] = (uint8_t)~cs;
+    for (int k = 0; k < 6; k++)
+        beacon6[k] = (uint32_t)b[4*k] | ((uint32_t)b[4*k+1] << 8) |
+                     ((uint32_t)b[4*k+2] << 16) | ((uint32_t)b[4*k+3] << 24);
+}
+void ldn_pico_advertise_peer(void)
+{
+    uint32_t beacon6[6];
+    if (s_peer_id_valid) build_gba_beacon(s_peer_tid, s_peer_name, beacon6);
+    else memcpy(beacon6, PEER_BEACON, sizeof(beacon6));
+    ldn_pico_send_peer(PEER_ID, beacon6); s_peer_sent++;
+}
 
 uint32_t ldn_pico_connect_count(void) { return s_connect_seen; }
 uint32_t ldn_pico_cmd_count(uint8_t cmd) { return s_cmd_hist[cmd]; }

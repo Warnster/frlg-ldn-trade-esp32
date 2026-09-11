@@ -68,13 +68,14 @@ static void brain_send(void *ctx, const uint8_t *dg, size_t len, const uint8_t d
 bool ldn_brain_active(void) { return s_active; }
 
 int ldn_brain_start(const uint8_t ssid[16], const uint8_t our_ip[4], const uint8_t host_ip[4],
-                    const uint8_t our_mac[6], const uint8_t host_mac[6]) {
+                    const uint8_t our_mac[6], const uint8_t host_mac[6], const char *joiner_name) {
     pia_crypto_init(&s_pc, ssid, FRLG_GAME_KEY);
 
+    const char *jn = (joiner_name && joiner_name[0]) ? joiner_name : "EMU";
     uint8_t random4[4];
     esp_fill_random(random4, sizeof(random4));
     pc_conn_init(&s_conn, our_mac, host_mac, our_ip, host_ip, PC_DEFAULT_OUR_VAR,
-                 "EMU", random4, NULL);
+                 jn, random4, NULL);
 
     memset(&s_engine, 0, sizeof(s_engine));
     s_engine.tick = eng_tick;

@@ -55,6 +55,17 @@ config LDN_PROBE_CONTROL_PORT
     depends on ESP_CONSOLE_UART_DEFAULT
     default n
 
+config LDN_GBA_SINGLE_CHIP
+    bool "Single-chip: talk to the GBA on-chip (core1 relay) instead of a Pico over UART"
+    default n
+    help
+        docs/16 Phase 2. When set, the GBA transport is the on-chip core1<->core0 shared-SRAM
+        relay (ldn_gba.c over gba_relay) and the bare-metal GBA adapter runs on core 1, brought up
+        by app_main before the LDN join loop. When unset, the classic ldn_pico.c UART bridge to a
+        separate Pico is used. Both export the same ldn_pico_* API, so the join FSM and brain are
+        identical either way. Requires the whole GBA link (SC=12 SO=11 SI=13 SD=14) wired straight
+        into this S3, not a Pico.
+
 config LDN_PROBE_LEGACY_PHY
     bool "Use 802.11b/g only for control-frame compatibility diagnostics"
     default n

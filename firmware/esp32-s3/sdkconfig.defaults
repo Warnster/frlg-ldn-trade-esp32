@@ -24,3 +24,23 @@ CONFIG_SPIRAM_RODATA=y
 
 # Higher tick rate so the ~2ms main-loop yield is real (was 0 ticks at 100Hz -> IDLE wdt flood)
 CONFIG_FREERTOS_HZ=1000
+
+# 240MHz CPU: the gba_spi bit-bang timing (CLK_GIVEUP, tight edge waits) is calibrated for 240MHz.
+# `idf.py set-target` regenerates sdkconfig from THIS file, and the IDF default is only 160MHz — which
+# regressed GBA adapter detection. Pin it here so a future set-target can't silently drop us to 160.
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# The core-1 GBA bit-bang spins with interrupts off, waiting on the GBA's clock — exactly like the
+# RP2040's bare, watchdog-free core-1 loop. The GBA paces RFU commands per-VBlank and pauses for the
+# 1-2s room-entry animation, so a legit clock gap can exceed the interrupt watchdog. Exempt CPU1 from
+# the interrupt + idle-task watchdogs so those pauses don't reboot us; the sample loops stay counter-free
+# (a counter in the hot path shifts the bit read — the RP2040's 0x494E->0x929C lesson). CPU0 keeps both.
+CONFIG_ESP_INT_WDT_CHECK_CPU1=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# HARD REAL-TIME core1: FreeRTOS (tick/scheduler/IPC) runs ONLY on core0; core1 is left empty and we
+# wake it manually into a bare, non-preemptible bit-bang loop (gba_core1.c) — the RP2040 model. This is
+# what removes the last ~1-in-700 mid-word ISR jitter that kicks us out of the room. (branch
+# hard-realtime-core1; core0 still runs the LDN/Switch side + shared-SRAM inter-core comms.)
+CONFIG_FREERTOS_UNICORE=y
