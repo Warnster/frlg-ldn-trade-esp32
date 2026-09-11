@@ -97,10 +97,22 @@ uint32_t gba_relay_cmd_count(uint8_t cmd);   /* per-command-byte count (full flo
  * the joining player instead of the hardcoded "EMU". */
 bool gba_relay_get_gba_identity(uint16_t *tid, uint8_t name8[8]);
 
-/* Build the PARENT UNI sub-frame the GBA expects while it is clock-slave (3-byte parent LLSF +
- * 70-byte gRecvCmds table: row0 = the Switch's slot, row1 = the GBA's own slot echoed back).
- * Returns the word count written (19 for a full frame). Call from core1; IRAM-safe. */
+/* Build the PARENT UNI sub-frame (3-byte parent LLSF + 70-byte gRecvCmds table: row0 = the
+ * Switch's slot, row1 = the GBA's own slot echoed back). Returns the word count written (19 for a
+ * full frame). Call from core1; IRAM-safe. The GBA pulls this via ReceiveData(0x26) after a
+ * wake-up notification — see gba_relay_take_parent_frame (docs/22). */
 int gba_relay_build_parent_frame(uint32_t *out, int max_words);
+
+/* ---- core1-side data-phase helpers (docs/22 wake-word model) ----
+ * fresh():        peek-only — has core0 published a Switch slot not yet consumed? The clock-master
+ *                 wait loop polls this to decide when to send the 0x99660028 wake word.
+ * wait_timeout_us: the waiting-state idle-wake timeout, from Setup(0x17) bits 0-7 (16.6ms frames;
+ *                 500ms fallback when unset) — on expiry the wake word is 0x99660027 instead.
+ * take_parent_frame: the full 0x26 response — count-header word + parent frame (20 words), or a
+ *                 lone zero-count word when nothing fresh. Consumes the mailbox. */
+bool     gba_relay_switch_slot_fresh(void);
+uint32_t gba_relay_wait_timeout_us(void);
+int      gba_relay_take_parent_frame(uint32_t *out, int max_words);
 
 #ifdef __cplusplus
 }

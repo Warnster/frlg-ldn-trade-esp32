@@ -22,6 +22,11 @@ typedef struct {
     _Atomic uint32_t switch_slot_seq;
     uint32_t switch_slot_seq_seen;     /* core1-owned only */
 
+    /* Waiting-state timeout, captured from Setup(0x17) bits 0-7 (units of 16.6ms frames; librfu
+     * default is 0 = no timeout, FRLG's usual 0x003C0420 -> 0x20 = 32 frames ~ 533ms). Written and
+     * read on core1 only (on_raw_command + the wait loop), so a plain field suffices. */
+    uint32_t setup_timeout_frames;
+
     /* diagnostics: decoded room-select bytes, captured passively via on_raw_command */
     _Atomic uint8_t  setup_role;
     uint32_t         setup_raw0;       /* plain — protected by setup_seen's release/acquire pair */
@@ -92,6 +97,12 @@ static IRAM_ATTR int gba_relay_take_slot_cb(uint32_t *out, int max, void *ctx)
     return len;
 }
 
+static IRAM_ATTR int gba_relay_take_frame_cb(uint32_t *out, int max, void *ctx)
+{
+    (void)ctx;
+    return gba_relay_take_parent_frame(out, max);
+}
+
 static IRAM_ATTR void gba_relay_put_slot_cb(const uint32_t *data, int len, void *ctx)
 {
     (void)ctx;
@@ -115,6 +126,7 @@ static IRAM_ATTR void gba_relay_on_raw_command_cb(uint8_t cmd, const uint32_t *d
     if (cmd == GBA_CMD_SETUP && len >= 1) {
         uint8_t role = (uint8_t)(data[0] >> 16);
         s_relay.setup_raw0 = data[0];
+        s_relay.setup_timeout_frames = data[0] & 0xFFu;   /* waiting-state wake timeout, in frames */
         atomic_store_explicit(&s_relay.setup_role, role, memory_order_relaxed);
         atomic_fetch_add_explicit(&s_relay.setup_seen, 1, memory_order_release);
     } else if (cmd == GBA_CMD_BROADCAST && len >= 4) {
@@ -142,6 +154,7 @@ void gba_relay_fill_io(gba_wap_io *io)
     io->get_peer       = gba_relay_get_peer_cb;
     io->peer_id        = gba_relay_peer_id_cb;
     io->take_slot      = gba_relay_take_slot_cb;
+    io->take_frame     = gba_relay_take_frame_cb;
     io->put_slot       = gba_relay_put_slot_cb;
     io->on_raw_command = gba_relay_on_raw_command_cb;
     io->ctx            = NULL;
@@ -234,6 +247,46 @@ int IRAM_ATTR gba_relay_build_parent_frame(uint32_t *out, int max_words)
                | ((o + 3 < (int)sizeof(f)) ? ((uint32_t)f[o + 3] << 24) : 0);
     }
     return nwords;
+}
+
+/* ---- core1-side data-phase helpers (docs/22 wake-word model) ---------------------------------
+ * The adapter's clock-master window is only a 2-word WAKE-UP notification; the payload itself is
+ * pulled by the GBA afterwards via ReceiveData(0x26). These three back that flow. */
+
+/* Peek: has core0 published a Switch slot we have not yet consumed? Does NOT consume — the wait
+ * loop peeks, then the subsequent 0x26 response (take_parent_frame) consumes. */
+bool IRAM_ATTR gba_relay_switch_slot_fresh(void)
+{
+    uint32_t seq = atomic_load_explicit(&s_relay.switch_slot_seq, memory_order_acquire);
+    return seq != s_relay.switch_slot_seq_seen;
+}
+
+/* Waiting-state wake timeout in microseconds. Setup(0x17) bits 0-7 x 16.6ms frames; librfu's
+ * default of 0 means "no timeout", but core1 must never wait unbounded (the game itself drops the
+ * link after ~1s of silence), so fall back to 500ms — the value afska documents real adapters
+ * using with the common Setup word. */
+uint32_t IRAM_ATTR gba_relay_wait_timeout_us(void)
+{
+    uint32_t frames = s_relay.setup_timeout_frames;
+    if (frames == 0) return 500000u;
+    return frames * 16600u;
+}
+
+/* The full ReceiveData(0x26) response: word0 = the received-byte-count header (bits 0-6 = # bytes
+ * from the host — afska wireless_adapter.md, ReceiveData), then the raw parent LLSF frame bytes.
+ * Consumes the switch-slot mailbox ("once data has been pulled out, it clears the data buffer").
+ * Nothing fresh -> a lone zero-count header word, the real adapter's "no data" reply. */
+int IRAM_ATTR gba_relay_take_parent_frame(uint32_t *out, int max_words)
+{
+    if (max_words < 1) return 0;
+    uint32_t seq = atomic_load_explicit(&s_relay.switch_slot_seq, memory_order_acquire);
+    if (seq == s_relay.switch_slot_seq_seen) {
+        out[0] = 0;
+        return 1;
+    }
+    s_relay.switch_slot_seq_seen = seq;
+    out[0] = (RFU_PARENT_FRAME_SIZE + RFU_COMM_TABLE_LENGTH) & 0x7Fu;   /* 73 bytes from host */
+    return 1 + gba_relay_build_parent_frame(out + 1, max_words - 1);
 }
 
 uint32_t gba_relay_wap_seen(void)     { return atomic_load_explicit(&s_relay.wap_seen,     memory_order_relaxed); }

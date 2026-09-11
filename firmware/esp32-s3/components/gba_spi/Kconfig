@@ -39,10 +39,12 @@ config GBA_SPI_CLOCK_MASTER
         waits for the adapter to clock the link. With this OFF the transport keeps sending the
         legacy (wrong but harmless) 0xA8 ack and never takes the clock — the GBA stays clock
         master, which is what every run so far has used. With it ON the adapter sends the correct
-        ack and drives SC itself via the dedicated-GPIO clock-master path.
+        ack, waits for a fresh Switch slot (or the Setup timeout), and clocks the 2-word wake-up
+        notification (0x99660028/27) itself via the dedicated-GPIO clock-master path — the GBA
+        then pulls the data with ReceiveData(0x26). See docs/22-data-phase-wake-word.md.
         These two must change together: the correct ack without clock-master drive silences the
         link permanently, and clock-master drive without the correct ack never gets the role.
-        UNPROVEN ON HARDWARE — this is the gate for the trade DATA phase. Turn on to test it.
+        This is the gate for the trade DATA phase.
 
 config GBA_SPI_MODE
     int "SPI slave mode (0-3) for the GBA link"
@@ -53,13 +55,3 @@ config GBA_SPI_MODE
         or garbled, try 0. This is the first go/no-go dial.
 
 endmenu
-
-config GBA_SPI_PARENT_PUSH
-    bool "Push a parent UNI frame as clock-master in the data phase (DISPROVEN, default off)"
-    depends on GBA_SPI_CLOCK_MASTER
-    default n
-    help
-      Experimental. When the GBA hands over the clock after the 0xA7 ack, actively clock a
-      0x28 + parent-frame into it. Disproven on hardware 2026-09-11 (GBA drives SO all-1s =
-      not listening; crashes faster). Off = clock one idle word and hand the clock back, the
-      behaviour that got furthest (trade-room entry animation).

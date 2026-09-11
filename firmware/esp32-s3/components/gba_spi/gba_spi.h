@@ -90,10 +90,11 @@ void gba_spi_bus_probe(void);
 extern volatile uint32_t g_gba_clock_seen, g_gba_logins, g_gba_cmds, g_gba_resets;
 extern volatile uint32_t g_gba_last_cmd, g_gba_last_reset, g_gba_skips, g_cmd_resyncs;
 extern volatile uint32_t g_word_resyncs;
-extern volatile uint32_t g_clock_master_swaps;
-extern volatile uint32_t g_parent_frames;
-extern volatile uint32_t g_parent_acks;
-extern volatile uint32_t g_parent_ack_last, g_parent_hdr_rx;  /* times we took the SC clock on a role-change ack */
+extern volatile uint32_t g_clock_master_swaps;                /* times we took the SC clock on a role-change ack */
+/* docs/22 wake-word diagnostics — see the declarations in gba_spi.c for meanings */
+extern volatile uint32_t g_wake_words, g_wake_armed, g_wake_acks;
+extern volatile uint32_t g_wake_timeouts, g_wait_aborts, g_hs_fallbacks;
+extern volatile uint32_t g_parent_ack_last, g_parent_hdr_rx;  /* raw wake word-2 / word-1 readbacks */
 extern volatile uint32_t g_core1_alive;
 extern volatile uint32_t g_cp;   /* checkpoint — see gba_spi.c's declaration comment */
 

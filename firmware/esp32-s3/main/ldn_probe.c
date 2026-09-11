@@ -1077,8 +1077,14 @@ static void run_private_join(void)
                        (int)s_target_confirmed, s_auto);
                 /* What flow is the GBA in? bcastRead(1c/1d/1e)=looking-for-rooms(join);
                  * startHost(19)/accept(1a)=hosting; connect(1f)=selected a room; send(25)=trade. */
+                /* Wake-word data-phase counters (docs/22): wake = 2-word notifications clocked;
+                 * armed = word-1 readback 0x80000000 (GBA really was slave-armed); wacks = word-2
+                 * readback 0x996600A8/A7 (fully accepted); wto = idle-timeout (0x27) wakes;
+                 * abort = waits abandoned because the GBA re-took SC; hsfb = missed SO handshake
+                 * responses (blind-settle fallback used). */
                 printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u"
-                       " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x clkmaster=%u pframes=%u packs=%u ackrx=%08x hdrrx=%08x\n",
+                       " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x clkmaster=%u"
+                       " wake=%u armed=%u wacks=%u wto=%u abort=%u hsfb=%u ackrx=%08x hdrrx=%08x\n",
                        (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
                        (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
                        (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
@@ -1086,7 +1092,9 @@ static void run_private_join(void)
                        (unsigned)ldn_pico_cmd_count(0x20), (unsigned)ldn_pico_cmd_count(0x21),
                        (unsigned)ldn_pico_cmd_count(0x26), (unsigned)ldn_pico_cmd_count(0x27),
                        (unsigned)ldn_pico_cmd_count(0x28), (unsigned)ldn_pico_cmd_count(0x35),
-                       (unsigned)g_gba_last_cmd, (unsigned)g_clock_master_swaps, (unsigned)g_parent_frames, (unsigned)g_parent_acks,
+                       (unsigned)g_gba_last_cmd, (unsigned)g_clock_master_swaps,
+                       (unsigned)g_wake_words, (unsigned)g_wake_armed, (unsigned)g_wake_acks,
+                       (unsigned)g_wake_timeouts, (unsigned)g_wait_aborts, (unsigned)g_hs_fallbacks,
                        (unsigned)g_parent_ack_last, (unsigned)g_parent_hdr_rx);
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);

@@ -99,6 +99,10 @@ typedef struct gba_wap_io {
     int      (*get_peer)(uint32_t out[7], void *ctx);          /* 7 words [peer_id,beacon x6] or 0 */
     uint32_t (*peer_id)(void *ctx);                            /* nonzero peer_id, or 0 if none */
     int      (*take_slot)(uint32_t *out, int max, void *ctx);  /* latest Switch slot, word count */
+    /* The full ReceiveData(0x26) response: count-header word + parent LLSF frame (docs/22 wake-word
+     * model — the GBA pulls trade data with 0x26 after our wake-up notification; the adapter never
+     * pushes it). NULL = fall back to take_slot (legacy raw-slot reply). Needs out capacity >=20. */
+    int      (*take_frame)(uint32_t *out, int max, void *ctx);
     void     (*put_slot)(const uint32_t *data, int len, void *ctx); /* the GBA's outgoing slot */
     /* Optional: called for EVERY command before dispatch (mirrors routes.rs::handle_req's
      * "mirror every outgoing command" philosophy). NULL = no-op. Lets a backend observe raw
@@ -119,7 +123,8 @@ typedef enum {
 } gba_wap_action;
 
 /* Given a received command header + its data words, produce the reply. Returns the reply word count
- * (into out, capacity >=8) and sets *action. Mirrors routes.rs handle_req/local_respond. */
+ * (into out, capacity >=24 — the 0x26 count-header + 19-word parent frame is the largest reply)
+ * and sets *action. Mirrors routes.rs handle_req/local_respond. */
 int gba_wap_respond(gba_wap_io *io, uint8_t command, const uint32_t *data, int len,
                     uint32_t *out, gba_wap_action *action);
 

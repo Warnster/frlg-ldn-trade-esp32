@@ -105,26 +105,23 @@ GBA_HOT int gba_wap_respond(gba_wap_io *io, uint8_t command, const uint32_t *dat
             return 1;
         }
 
-        case GBA_CMD_RECV_DATA:                       /* 0x26 / 0x28 -> latest Switch slot */
+        case GBA_CMD_RECV_DATA:                       /* 0x26 / 0x28 -> count header + parent frame */
         case GBA_CMD_RECV_DATA_WAIT_RESP:
+            /* docs/22 wake-word model: the adapter's clock-master window is only a 2-word wake-up
+             * notification (0x99660028) — the GBA then pulls the actual data HERE, as clock master
+             * again. take_frame answers with the received-byte-count header word + the parent LLSF
+             * frame (afska wireless_adapter.md, ReceiveData). take_slot remains the legacy raw-slot
+             * reply for backends that never grew a frame path (selftest stubs, 2-chip build). */
+            if (io->take_frame) return io->take_frame(out, 24, io->ctx);
             return io->take_slot ? io->take_slot(out, 8, io->ctx) : 0;
 
         /* ---- ASYNC_ACK family: 0x25/0x27/0x35/0x36/0x37 ------------------------------------
-         * KNOWN-WRONG, DELIBERATELY NOT YET CHANGED (2026-09-11 decomp research). The transport
-         * currently answers all of these with a hardcoded header 0x996600A8 plus one extra idle
-         * word. Per pokefirered librfu_intr.c the GBA actually expects the ack for the command it
-         * sent — 0x25->0xA5, 0x27->0xA7, 0x35->0xB5, 0x37->0xB7 (i.e. just cmd|0x80, which
-         * gba_wap_response_header already computes) — and NO trailing word (with ackLength=0 the
-         * GBA stops clocking after the header, so our extra word is consumed as the next command's
-         * header). 0xA8 is the GBA's OWN ack to an adapter-originated 0x28 in slave mode: the wrong
-         * side's word.
-         * WHY IT IS STILL HERE: those four correct acks are exactly the ones that set the GBA's
-         * msMode = AGB_CLK_SLAVE — after them the GBA STOPS DRIVING SC and waits for the ADAPTER to
-         * clock the link. We have no clock-master path at all (SC is input-only, gba_spi.c), so
-         * sending the "correct" ack today would permanently silence the link (librfu_stwi.c: once
-         * clock-slave, STWI_init returns ERR_REQ_CMD_CLOCK_SLAVE without touching SIOCNT).
-         * Fixing this ack and implementing SC clock-master drive are ONE task and must land
-         * together — that is the next architectural step for the trade DATA phase. */
+         * Per pokefirered librfu_intr.c the GBA expects the ack for the command it sent —
+         * 0x25->0xA5, 0x27->0xA7, 0x35->0xB5, 0x37->0xB7 (cmd|0x80, no trailing word) — and that
+         * ack flips the GBA's msMode to AGB_CLK_SLAVE: it stops driving SC and waits for the
+         * ADAPTER to send a wake-up notification as clock master. The CONFIG_GBA_SPI_CLOCK_MASTER
+         * transport implements that (correct ack + wait-then-wake, docs/22); the legacy transport
+         * path still fakes it with the historical 0xA8+idle pattern. */
         case GBA_CMD_SEND_DATA:                       /* 0x24 ID_DATA_TX_REQ — send WITHOUT a clock
                                                        * change. Was falling through to the default
                                                        * bare ack, which replies correctly but never
