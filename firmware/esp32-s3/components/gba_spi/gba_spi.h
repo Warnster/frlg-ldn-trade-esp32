@@ -60,6 +60,16 @@ void gba_spi_selftest(void);
  * returns. Leave CONFIG_GBA_SPI_TRADE_RELAY_SELFTEST off for normal builds. */
 void gba_spi_trade_relay_selftest(void);
 
+/* ---- clock-master path (trade data phase), gba_spi.c ----
+ * The RFU clock role swaps: the GBA drives SC for discovery/connect, then hands the clock over for
+ * the data phase and goes silent until the ADAPTER clocks the link. These drive that direction.
+ * Call acquire() once, then master_xfer_word() per word, then release(). All IRAM/core-1 safe.
+ * NOT yet wired into the command loop — must land together with the ASYNC_ACK fix (gba_wap.c),
+ * since those acks are what put the GBA into clock-slave mode in the first place. */
+void     gba_spi_clock_master_acquire(void);
+void     gba_spi_clock_master_release(void);
+uint32_t gba_spi_master_xfer_word(uint32_t tx_word);
+
 /* GPIO bus-stall probe (gba_busprobe.c, 2026-09-11): core 1 times back-to-back GPIO_IN_REG reads
  * while core 0 cycles load phases (quiet/uart/flash/psram/all) — measures whether shared-bus
  * arbitration can stall a core-1 GPIO read past the 250ns half-bit budget (docs/17 §7). Runs

@@ -71,6 +71,29 @@ GBA_HOT int gba_wap_respond(gba_wap_io *io, uint8_t command, const uint32_t *dat
             return 1;
         }
 
+        case GBA_CMD_DISCONNECT:                      /* 0x30 -> the player backed out / link torn down */
+            /* Clear our connect state so a subsequent Connect starts clean instead of inheriting
+             * "already connected" (which would skip the connecting-poll fakeout and desync the
+             * GBA's link manager). Bare ack is correct for the disconnect itself. */
+            io->connected = false;
+            io->connecting_polls = 0;
+            return 0;
+
+        case GBA_CMD_CPR_START:                       /* 0x32/0x33/0x34 connection RECOVERY family */
+        case GBA_CMD_CPR_POLL:
+        case GBA_CMD_CPR_END: {
+            /* Same status-word contract as the CP family (0x20/0x21): ALWAYS exactly one data word,
+             * status<<24 | slot<<16 | (id & 0xFFFF). Previously these fell through to the bare-ack
+             * default (zero words), leaving librfu to read stale bytes as the recovery status — the
+             * likely cause of the GBA hanging when the player cancels mid-connect.
+             * INFERRED, NOT YET PROVEN: the decomp confirms the layout for CP_POLL/CP_END and CPR is
+             * documented as the same family; validate against hardware when the freeze is retested. */
+            uint32_t id = io->peer_id ? io->peer_id(io->ctx) : 0;
+            if (id == 0) { out[0] = 0x03000000; return 1; }   /* no peer -> disconnected */
+            out[0] = (id & 0xFFFFu);                          /* status 0x00 = recovered/connected */
+            return 1;
+        }
+
         case GBA_CMD_RECV_DATA:                       /* 0x26 / 0x28 -> latest Switch slot */
         case GBA_CMD_RECV_DATA_WAIT_RESP:
             return io->take_slot ? io->take_slot(out, 8, io->ctx) : 0;

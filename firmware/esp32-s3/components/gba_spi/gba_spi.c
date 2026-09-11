@@ -61,6 +61,7 @@ static const char *TAG = "gba_spi";
 #include "esp_rom_gpio.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/gpio_struct.h"   /* GPIO.func_out_sel_cfg — SI oen_sel override below */
+#define DG_SC_OUT_BIT 0x2u                     /* core1 dedic OUT channel 1 -> SC (clock-master drive) */
 #define DG_SC_BIT   0x1u                       /* core1 dedic IN  channel 0 */
 #define DG_SO_BIT   0x2u                       /* core1 dedic IN  channel 1 */
 #define DG_SD_BIT   0x4u                       /* core1 dedic IN  channel 2 (unused, routed anyway) */
@@ -72,6 +73,13 @@ static const char *TAG = "gba_spi";
 #define SO_HIGH()   (dedic_gpio_cpu_ll_read_in() & DG_SO_BIT)
 #define SI_HIGH()   dedic_gpio_cpu_ll_write_mask(DG_SI_BIT, DG_SI_BIT)   /* one ee.wr_mask_gpio_out */
 #define SI_LOW()    dedic_gpio_cpu_ll_write_mask(DG_SI_BIT, 0)
+/* Clock-master drive of SC (see gba_spi_master_xfer_word). The pad's output-enable is toggled via
+ * GPIO_ENABLE_W1TS/W1TC — plain register writes, IRAM-safe (ESP-IDF's gpio_set_direction is
+ * flash-resident and must never be called from bare-metal core 1). */
+#define SC_DRIVE_HIGH() dedic_gpio_cpu_ll_write_mask(DG_SC_OUT_BIT, DG_SC_OUT_BIT)
+#define SC_DRIVE_LOW()  dedic_gpio_cpu_ll_write_mask(DG_SC_OUT_BIT, 0)
+#define SC_OUT_ENABLE()  REG_WRITE(GPIO_ENABLE_W1TS_REG, SC_MASK)
+#define SC_OUT_DISABLE() REG_WRITE(GPIO_ENABLE_W1TC_REG, SC_MASK)
 /* DEBOUNCE (2026-09-11, found on hardware): raw ee.get_gpio_in is ASYNC and ~4ns-granular — during
  * SC's real 5-20ns breadboard rise/fall the loop reads the transition bouncing 0/1/0/1 and counts
  * phantom edges. First dedic login attempt read HUNDREDS of garbled challenges, all bit-SHIFTED
@@ -301,12 +309,25 @@ void gba_spi_init(void)
     esp_rom_gpio_connect_in_signal(GBA_SO_PIN, CORE1_GPIO_IN1_IDX, false);
     esp_rom_gpio_connect_in_signal(GBA_SD_PIN, CORE1_GPIO_IN2_IDX, false);
     esp_rom_gpio_connect_out_signal(GBA_SI_PIN, CORE1_GPIO_OUT0_IDX, false, false);
+    /* SC also gets a core-1 dedicated OUT channel so we can DRIVE the clock during the trade data
+     * phase (the RFU clock role swaps — see gba_spi_master_xfer_word). Routing the out signal is
+     * harmless while the pad's output-enable stays CLEAR: the GBA keeps driving SC and we only
+     * listen. gpio_config() above left SC as INPUT, i.e. GPIO_ENABLE bit clear — we explicitly
+     * clear it again here so this can never come up driving and fight the GBA. */
+    esp_rom_gpio_connect_out_signal(GBA_SC_PIN, CORE1_GPIO_OUT1_IDX, false, false);
+    GPIO.func_out_sel_cfg[GBA_SC_PIN].oen_sel = 1;   /* OE from GPIO_ENABLE, which we control */
+    SC_OUT_DISABLE();                                 /* stay an input until we take the clock */
     /* Force SI's pad output-enable to come from GPIO_ENABLE (set by gpio_config above) instead of
      * the routed peripheral signal's OE. SI is a PERMANENTLY-driven output in the adapter role
      * (the RP2040 reference also drives p_tx unconditionally), so constant OE is exactly right —
      * and it removes any dependence on whether the dedic out channel asserts its own OE. */
     GPIO.func_out_sel_cfg[GBA_SI_PIN].oen_sel = 1;
     ESP_LOGI(TAG, "DEDICATED GPIO active: core1 ee.get_gpio_in/ee.wr_mask_gpio_out (1-cycle, APB-bypass)");
+    /* SAFETY: SC is bidirectional now (clock-master path). Confirm at boot that our driver is OFF,
+     * i.e. the GBA still owns the clock — if this ever reads driving, we'd be fighting the GBA on a
+     * shared push-pull line. Must read 0. */
+    ESP_LOGI(TAG, "SC clock-master driver: %s (must be 'off' at boot; GBA owns SC until the data phase)",
+             (REG_READ(GPIO_ENABLE_REG) & SC_MASK) ? "ON *** UNEXPECTED ***" : "off");
 #else
     SI_HIGH();                 /* SI idles high between words */
 #endif
@@ -482,6 +503,67 @@ static IRAM_ATTR bool xfer_word(uint32_t tx, uint32_t *rx_word)
     }
     if (rx_word) *rx_word = rx;
     return true;                                   /* SI left HIGH (idle) */
+}
+
+/* ---- CLOCK-MASTER path (trade data phase) --------------------------------------------------
+ * WHY THIS EXISTS: the RFU clock role SWAPS. For discovery/connect the GBA drives SC and we are the
+ * clock slave (everything above). But the GBA's link manager, on entering the data phase, issues a
+ * clock-role change (0x25/0x27/0x35/0x37 + their A5/A7/B5/B7 acks) after which — per the decompiled
+ * pokefirered librfu (librfu_intr.c sets msMode = AGB_CLK_SLAVE; librfu_stwi.c then returns
+ * ERR_REQ_CMD_CLOCK_SLAVE from STWI_init without touching SIOCNT) — the GBA STOPS DRIVING SC
+ * ENTIRELY and waits for the ADAPTER to clock the link. Without this path every trade data exchange
+ * deadlocks: the GBA is silent forever and our slave loop waits for edges that never come.
+ *
+ * STATUS: implemented and compiled, but NOT yet wired into the command loop — it must land together
+ * with the ASYNC_ACK fix (see gba_wap.c's ASYNC_ACK comment), because it is precisely those correct
+ * acks that put the GBA into clock-slave mode. Enabling one without the other breaks the link. The
+ * electrical direction handling below is the part that is safe to prove independently.
+ *
+ * DIRECTION SAFETY: SC is bidirectional now. We only assert our driver between acquire/release, and
+ * we release in every exit path, so the GBA and this board can never both drive for longer than the
+ * handoff instant (the series resistor on SC covers that window — see docs/18).
+ *
+ * TIMING: mirror-image of the slave loop's sampling contract (data presented while SC is low, both
+ * sides sample on the rising edge). ~2 MHz link => 250 ns per half-period = 60 cycles @240 MHz. */
+#ifndef GBA_SC_HALF_CYCLES
+#define GBA_SC_HALF_CYCLES 60
+#endif
+
+static inline IRAM_ATTR void sc_delay(uint32_t cycles)
+{
+    uint32_t t0 = ccount();
+    while ((uint32_t)(ccount() - t0) < cycles) { }
+}
+
+/* Take/release the clock. Idle level is HIGH (matching the GBA's own idle SC). */
+IRAM_ATTR void gba_spi_clock_master_acquire(void)
+{
+    SC_DRIVE_HIGH();      /* preset the level BEFORE enabling the driver — no glitch on the line */
+    SC_OUT_ENABLE();
+}
+IRAM_ATTR void gba_spi_clock_master_release(void)
+{
+    SC_DRIVE_HIGH();      /* leave it idle-high as we hand back */
+    SC_OUT_DISABLE();     /* pad returns to input; the GBA owns SC again */
+}
+
+/* One 32-bit exchange with US driving SC. MSB-first, same bit order/sampling edge as the slave path:
+ * SC low + present our SI bit -> settle -> SC high (both sides sample) -> hold. Returns the word the
+ * GBA presented on SO. Caller must hold the clock (acquire/release around a whole transaction). */
+IRAM_ATTR uint32_t gba_spi_master_xfer_word(uint32_t tx)
+{
+    uint32_t rx = 0;
+    for (int i = 31; i >= 0; i--) {
+        SC_DRIVE_LOW();
+        if ((tx >> i) & 1u) SI_HIGH(); else SI_LOW();   /* present our bit while SC is low */
+        sc_delay(GBA_SC_HALF_CYCLES);
+        SC_DRIVE_HIGH();                                /* rising edge: the GBA samples SI here */
+        uint32_t v = LINK_IN();                         /* ...and presents SO; sample it now */
+        rx = (rx << 1) | (LINK_SO(v) ? 1u : 0u);
+        sc_delay(GBA_SC_HALF_CYCLES);
+    }
+    SI_HIGH();                                          /* idle-high between words, as in slave mode */
+    return rx;
 }
 
 /* External wrapper (provider-shim). run_adapter calls xfer_word directly under its session-wide lock. */

@@ -69,6 +69,19 @@ enum {
     GBA_CMD_UNK35_AND_CHANGE = 0x35,
     GBA_CMD_UNK36_AND_CHANGE = 0x36,
     GBA_CMD_RESUME_RETRANSMIT_AND_CHANGE = 0x37,
+    /* 2026-09-11, from the decomp's authoritative list (pokefirered include/librfu.h:55-83).
+     * These were previously undefined here and fell through to the generic bare-ack default —
+     * i.e. a reply with ZERO data words. For the CP/CPR status family that is exactly the pattern
+     * that strands librfu (rfu_getConnectParentStatus then reads STALE buffer bytes as the
+     * status/id), the same bug already fixed for CP_POLL/CP_END. Prime suspect for the observed
+     * "GBA freezes if the player backs out mid-connect". */
+    GBA_CMD_DISCONNECT      = 0x30,   /* ID_DISCONNECT_REQ — tear the link down */
+    GBA_CMD_CPR_START       = 0x32,   /* ID_CPR_START_REQ  — connection RECOVERY (re-connect) */
+    GBA_CMD_CPR_POLL        = 0x33,   /* ID_CPR_POLL_REQ */
+    GBA_CMD_CPR_END         = 0x34,   /* ID_CPR_END_REQ */
+    GBA_CMD_STOP_MODE       = 0x3d,   /* ID_STOP_MODE_REQ (NB: the RP2040 enum calls 0x3d "Init2" —
+                                       * librfu says STOP_MODE; it is the most frequent command we
+                                       * see in the lobby, so the naming there looks wrong) */
 };
 
 /* Providers wire the adapter logic to the LDN/Switch side (the peer advert + trade slots). */
