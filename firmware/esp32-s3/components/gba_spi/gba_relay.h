@@ -97,6 +97,11 @@ uint32_t gba_relay_cmd_count(uint8_t cmd);   /* per-command-byte count (full flo
  * the joining player instead of the hardcoded "EMU". */
 bool gba_relay_get_gba_identity(uint16_t *tid, uint8_t name8[8]);
 
+/* Build the PARENT UNI sub-frame the GBA expects while it is clock-slave (3-byte parent LLSF +
+ * 70-byte gRecvCmds table: row0 = the Switch's slot, row1 = the GBA's own slot echoed back).
+ * Returns the word count written (19 for a full frame). Call from core1; IRAM-safe. */
+int gba_relay_build_parent_frame(uint32_t *out, int max_words);
+
 #ifdef __cplusplus
 }
 #endif

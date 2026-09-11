@@ -53,3 +53,13 @@ config GBA_SPI_MODE
         or garbled, try 0. This is the first go/no-go dial.
 
 endmenu
+
+config GBA_SPI_PARENT_PUSH
+    bool "Push a parent UNI frame as clock-master in the data phase (DISPROVEN, default off)"
+    depends on GBA_SPI_CLOCK_MASTER
+    default n
+    help
+      Experimental. When the GBA hands over the clock after the 0xA7 ack, actively clock a
+      0x28 + parent-frame into it. Disproven on hardware 2026-09-11 (GBA drives SO all-1s =
+      not listening; crashes faster). Off = clock one idle word and hand the clock back, the
+      behaviour that got furthest (trade-room entry animation).

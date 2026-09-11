@@ -181,6 +181,61 @@ void gba_relay_put_switch_slot(const uint32_t *data, int len)
     atomic_fetch_add_explicit(&s_relay.switch_slot_seq, 1, memory_order_release);
 }
 
+/* ---- PARENT frame builder (trade data phase, clock-master push) ------------------------------
+ * Once the GBA is clock-slave it expects the ADAPTER to send it a parent UNI sub-frame. Layout
+ * ported from pokeldn's hardware-proven builders (pokeldn/gba/rfu.py _parent_llsf/parent_uni_slot/
+ * pack_recv_cmds), which mirror rfu_STC_UNI_constructLLSF / rfu_UNI_setSendData:
+ *
+ *   3-byte parent LLSF, little-endian:
+ *     (state&0xF)<<14 | (ack&1)<<13 | (n&3)<<11 | (phase&3)<<9 | (bmSlot&0xF)<<18 | (size&0x7F)
+ *   + 70-byte gRecvCmds table = 5 rows x 14 bytes
+ *     row0 = the PARENT's own command (here: the Switch's slot, relayed)
+ *     row1 = the CHILD's command mirrored back (the GBA's own last slot — the child waits to see
+ *            its own command echoed before advancing; pokeldn/gba/rfu_leader.py:52)
+ *     rows 2-4 zero for a 2-player link (ReadAllPlayerRecvCmds, link_rfu_2.c:743)
+ *
+ * Returns the word count written (73 bytes -> 19 words, zero-padded). IRAM-safe, no allocation. */
+#define RFU_LCOM_UNI          4
+#define RFU_COMM_SLOT_LENGTH  14
+#define RFU_COMM_TABLE_LENGTH 70
+#define RFU_PARENT_FRAME_SIZE 3
+
+int IRAM_ATTR gba_relay_build_parent_frame(uint32_t *out, int max_words)
+{
+    uint8_t f[RFU_PARENT_FRAME_SIZE + RFU_COMM_TABLE_LENGTH];
+    memset(f, 0, sizeof(f));
+    uint32_t llsf = ((uint32_t)(RFU_LCOM_UNI & 0xF) << 14)
+                  | ((uint32_t)(1u & 0xF) << 18)            /* bmSlot = 1 (one child) */
+                  | ((uint32_t)RFU_COMM_TABLE_LENGTH & 0x7Fu);
+    f[0] = (uint8_t)(llsf); f[1] = (uint8_t)(llsf >> 8); f[2] = (uint8_t)(llsf >> 16);
+    uint8_t *table = f + RFU_PARENT_FRAME_SIZE;
+    /* row0 — the Switch's latest slot (what we are relaying INTO the GBA). */
+    int slen = (int)atomic_load_explicit(&s_relay.switch_slot_len, memory_order_acquire);
+    for (int i = 0; i < slen && i * 4 < RFU_COMM_SLOT_LENGTH; i++) {
+        uint32_t w = s_relay.switch_slot[i];
+        for (int b = 0; b < 4 && i * 4 + b < RFU_COMM_SLOT_LENGTH; b++)
+            table[i * 4 + b] = (uint8_t)(w >> (8 * b));
+    }
+    /* row1 — echo the GBA's own last slot straight back (the child looks for this). */
+    int glen = (int)atomic_load_explicit(&s_relay.gba_slot_len, memory_order_acquire);
+    uint8_t *row1 = table + RFU_COMM_SLOT_LENGTH;
+    for (int i = 0; i < glen && i * 4 < RFU_COMM_SLOT_LENGTH; i++) {
+        uint32_t w = s_relay.gba_slot[i];
+        for (int b = 0; b < 4 && i * 4 + b < RFU_COMM_SLOT_LENGTH; b++)
+            row1[i * 4 + b] = (uint8_t)(w >> (8 * b));
+    }
+    int nwords = (int)((sizeof(f) + 3) / 4);            /* 73 bytes -> 19 words, zero-padded */
+    if (nwords > max_words) nwords = max_words;
+    for (int i = 0; i < nwords; i++) {
+        int o = i * 4;
+        out[i] = (uint32_t)f[o]
+               | ((o + 1 < (int)sizeof(f)) ? ((uint32_t)f[o + 1] << 8)  : 0)
+               | ((o + 2 < (int)sizeof(f)) ? ((uint32_t)f[o + 2] << 16) : 0)
+               | ((o + 3 < (int)sizeof(f)) ? ((uint32_t)f[o + 3] << 24) : 0);
+    }
+    return nwords;
+}
+
 uint32_t gba_relay_wap_seen(void)     { return atomic_load_explicit(&s_relay.wap_seen,     memory_order_relaxed); }
 uint32_t gba_relay_connect_count(void){ return atomic_load_explicit(&s_relay.connect_seen, memory_order_relaxed); }
 uint32_t gba_relay_send_count(void)   { return atomic_load_explicit(&s_relay.send_seen,     memory_order_relaxed); }

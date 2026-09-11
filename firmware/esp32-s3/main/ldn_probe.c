@@ -1078,7 +1078,7 @@ static void run_private_join(void)
                 /* What flow is the GBA in? bcastRead(1c/1d/1e)=looking-for-rooms(join);
                  * startHost(19)/accept(1a)=hosting; connect(1f)=selected a room; send(25)=trade. */
                 printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u"
-                       " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x\n",
+                       " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x clkmaster=%u pframes=%u packs=%u ackrx=%08x hdrrx=%08x\n",
                        (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
                        (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
                        (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
@@ -1086,7 +1086,8 @@ static void run_private_join(void)
                        (unsigned)ldn_pico_cmd_count(0x20), (unsigned)ldn_pico_cmd_count(0x21),
                        (unsigned)ldn_pico_cmd_count(0x26), (unsigned)ldn_pico_cmd_count(0x27),
                        (unsigned)ldn_pico_cmd_count(0x28), (unsigned)ldn_pico_cmd_count(0x35),
-                       (unsigned)g_gba_last_cmd);
+                       (unsigned)g_gba_last_cmd, (unsigned)g_clock_master_swaps, (unsigned)g_parent_frames, (unsigned)g_parent_acks,
+                       (unsigned)g_parent_ack_last, (unsigned)g_parent_hdr_rx);
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);
                 printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",

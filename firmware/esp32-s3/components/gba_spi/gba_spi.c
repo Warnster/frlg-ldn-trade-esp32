@@ -8,6 +8,7 @@
  * bits, no CS. Pinned to core1; Wi-Fi/LDN stay on core0. See GBA_SPI_SLAVE_DESIGN.md. */
 #include "gba_spi.h"
 #include "gba_wap.h"
+#include "gba_relay.h"   /* parent-frame builder for the clock-master data push */
 #include <string.h>
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -146,7 +147,11 @@ volatile uint32_t g_gba_skips;   /* idle/non-0x9966 frames skipped while waiting
 volatile uint32_t g_cmd_resyncs; /* times cmd_resync() recovered a single-bit slip without a full re-login */
 volatile uint32_t g_word_resyncs; /* times a bad header self-corrected on the VERY NEXT aligned word —
                                     * no bit-shifting, no relogin, just one extra transfer (round 5 fix) */
-volatile uint32_t g_clock_master_swaps;  /* times we took the clock on a role-change ack */
+volatile uint32_t g_clock_master_swaps;
+volatile uint32_t g_parent_frames;        /* parent UNI frames pushed to the GBA as clock master */
+volatile uint32_t g_parent_acks;          /* of those, how many the GBA acked with 0x996600A8 */
+volatile uint32_t g_parent_ack_last;      /* raw word read back in the ack slot — the diagnosis */
+volatile uint32_t g_parent_hdr_rx;        /* raw word the GBA emitted while we clocked the 0x28 header */  /* times we took the clock on a role-change ack */
 volatile uint32_t g_login_rx[16], g_login_n;   /* rolling record of login challenge words core1 reads */
 
 /* ---- command-loop trace (temporary) — every xfer_word tx/rx pair in the command phase, rolling.
@@ -567,6 +572,29 @@ IRAM_ATTR uint32_t gba_spi_master_xfer_word(uint32_t tx)
     return rx;
 }
 
+/* One master word WITH the GBA's slave-side inter-word handshake (librfu_intr.c IntrSIO32, slave
+ * path). The GBA's per-word ISR gates on OUR SI line: it enters with handshake_wait(0) — spins
+ * until the GBA's SI *input* (our SI output) reads LOW — processes the word + reloads SIODATA32,
+ * then handshake_wait(1) — spins until it reads HIGH — and only THEN re-enables its SIO for the
+ * next transfer. So after every clocked word we must swing SI low, hold long enough for the ISR to
+ * enter (worst-case interrupt latency, tens of us), then high, then settle before clocking again.
+ * Clocking back-to-back words without this leaves the GBA mid-ISR while bits fly — the immediate
+ * hard-crash observed on hardware. Delays are deliberately generous; the GBA self-paces inside
+ * handshake_wait, so too-slow is safe and too-fast is fatal. */
+#ifndef GBA_MASTER_HS_LOW_US
+#define GBA_MASTER_HS_LOW_US  80
+#endif
+#ifndef GBA_MASTER_HS_HIGH_US
+#define GBA_MASTER_HS_HIGH_US 30
+#endif
+static IRAM_ATTR uint32_t master_word_handshaken(uint32_t tx)
+{
+    uint32_t rx = gba_spi_master_xfer_word(tx);
+    SI_LOW();  esp_rom_delay_us(GBA_MASTER_HS_LOW_US);   /* ISR entry gate: handshake_wait(0) */
+    SI_HIGH(); esp_rom_delay_us(GBA_MASTER_HS_HIGH_US);  /* ISR exit gate:  handshake_wait(1) */
+    return rx;
+}
+
 /* External wrapper (provider-shim). run_adapter calls xfer_word directly under its session-wide lock. */
 IRAM_ATTR bool gba_spi_exchange_word(uint32_t tx_word, uint32_t *rx_word)
 {
@@ -754,14 +782,41 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                 g_cp = 3;
                 xfer_word(tx1, &dummy); cmd_trace_push('a', tx1, dummy);
                 g_clock_master_swaps++;
+#if CONFIG_GBA_SPI_PARENT_PUSH
+                /* EXPERIMENTAL master data-phase push. DISPROVEN on hardware 2026-09-11: when we
+                 * take the clock after the 0xA7 ack and clock our frame in, the GBA drives SO all-1s
+                 * (hdrrx=0xffc00000, ackrx=0xffffffff) — i.e. it is NOT in a slave-receive-data
+                 * exchange at that instant, so the frame lands on a dead line and the extra clocking
+                 * crashes the GBA *faster* than doing nothing. Kept behind a flag (default OFF) as a
+                 * record; do not enable without new evidence about WHEN the GBA actually listens. */
+                uint32_t pf[20];
+                int pfn = gba_relay_build_parent_frame(pf, (int)(sizeof(pf) / sizeof(pf[0])));
                 gba_spi_clock_master_acquire();
-                /* Clock out one idle word as master so the GBA's slave-side DMA completes, then
-                 * hand the clock straight back. This is the minimal, conservative handoff — the
-                 * full data-phase exchange belongs here once this much is proven on hardware. */
+                g_cp = 4;
+                esp_rom_delay_us(150);
+                uint32_t mrx = master_word_handshaken(gba_wap_header(0x28, (uint8_t)pfn));
+                g_parent_hdr_rx = mrx;
+                cmd_trace_push('M', (uint32_t)pfn, mrx);
+                for (int i = 0; i < pfn; i++) (void)master_word_handshaken(pf[i]);
+                uint32_t ack = master_word_handshaken(0x80000000u);
+                g_parent_ack_last = ack;
+                cmd_trace_push('K', 0x80000000u, ack);
+                gba_spi_clock_master_release();
+                g_parent_frames++;
+                if ((ack & 0xFFFFFFFFu) == 0x996600A8u) g_parent_acks++;
+#else
+                /* BEST-KNOWN behaviour (got furthest on hardware: GBA played the trade-room entry
+                 * animation before dropping). After the correct 0xA7 ack the GBA is clock-slave;
+                 * clock exactly ONE idle word so its slave-side DMA/handshake completes, then hand
+                 * the clock straight back and let the GBA drive again. Touch the clock as little as
+                 * possible — every extra master word we push destabilises it. */
+                gba_spi_clock_master_acquire();
                 g_cp = 4;
                 uint32_t mrx = gba_spi_master_xfer_word(IDLE_WORD);
-                cmd_trace_push('M', IDLE_WORD, mrx);
+                g_parent_hdr_rx = mrx;
+                cmd_trace_push('i', IDLE_WORD, mrx);
                 gba_spi_clock_master_release();
+#endif
 #else
                 uint32_t tx1 = gba_wap_header(0xa8, 0);
                 g_cp = 3;
