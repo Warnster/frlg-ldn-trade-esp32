@@ -338,6 +338,12 @@ static bool s_joining;
  * cycle 1/6/11 and retry until one lands or the deadline passes — instead of the wrong channel
  * silently never reaching the Switch. */
 static bool s_join_committed;
+/* Deferred join (see AUTO_ARMED): the GBA's Connect only LATCHES the intent; the heavy Wi-Fi
+ * (re)configure runs a beat later so it can't starve the GBA's connect handshake. 1.2s is well
+ * inside the GBA's ~5-8s join timeout while clearing its ~80/50ms STWI retry window many times over. */
+#define LDN_JOIN_DEFER_US 1200000
+static bool s_join_pending;
+static int64_t s_join_pending_at;
 static volatile bool s_join_retry;
 static int64_t s_join_deadline;
 static int s_join_ch_idx;
@@ -607,6 +613,7 @@ void ldn_session_stop(void)
 {
     s_joining = false;
     s_join_committed = false; s_join_retry = false;   /* any teardown ends a committed join */
+    s_join_pending = false;                            /* ...and cancels a deferred one */
     ldn_udp_stop();
     esp_wifi_disconnect();
     /* Stop the driver before replacing key material or accepting another room. */
@@ -914,12 +921,30 @@ static void auto_poll(void)
         /* The peer is in the GBA's Join-Group list (advertised from the main loop). Join the Switch
          * ONLY when the player picks it — a new Connect (0x1f) forwarded by the Pico. */
         if (ldn_pico_connect_count() != s_connect_baseline) {
+            /* 2026-09-11 (decomp research): do NOT start the Wi-Fi join on the same tick as the
+             * GBA's Connect. ldn_session_configure() synchronously runs TWO full driver
+             * teardown/bring-up cycles (ldn_session_stop -> esp_wifi_disconnect/stop/start, then
+             * stop/set_mac/start/set_config/connect) — hundreds of ms — kicked off by the very
+             * command whose reply the GBA is waiting on. The GBA's own STWI retry budget is only
+             * ~80ms -> ~50ms -> 2 retries before ERR_REQ_CMD_CLOCK_DRIFT, after which
+             * AgbRfu_LinkManager refuses to advance past ID_CP_START_REQ and link_rfu_2 times the
+             * join out (~300-480 frames) => "couldn't join". So latch here and let the GBA finish
+             * its CP_START -> CP_POLL -> CP_END handshake on core1 first; the join runs a beat
+             * later, still far inside the GBA's multi-second join window. */
+            s_connect_baseline = ldn_pico_connect_count();
+            s_join_pending = true;
+            s_join_pending_at = esp_timer_get_time();
+            printf("LDN_AUTO gba-selected -> connect handshake first, join deferred\n");
+        } else if (s_join_pending &&
+                   esp_timer_get_time() - s_join_pending_at > LDN_JOIN_DEFER_US) {
+            s_join_pending = false;
             s_join_committed = true; s_join_retry = false;
             s_join_deadline = esp_timer_get_time() + 25000000;   /* 25s to land the association */
             /* try the armed channel first, then cycle the other two */
             s_join_ch_idx = (s_armed_ch == 6) ? 1 : (s_armed_ch == 11) ? 2 : 0;
             esp_err_t r = ldn_session_configure(s_armed_ssid, s_armed_bssid, s_armed_ccmp, s_armed_ch);
-            printf("LDN_AUTO gba-selected -> configure ch=%u result=%d\n", s_armed_ch, (int)r);
+            printf("LDN_AUTO deferred join -> configure ch=%u result=%d (gba cmds since connect: %u)\n",
+                   s_armed_ch, (int)r, (unsigned)ldn_pico_cmd_count(0x20) + (unsigned)ldn_pico_cmd_count(0x21));
             s_auto = AUTO_JOINING;                     /* stay committed; retry path owns channel cycling */
             if (r != ESP_OK) s_join_retry = true;
         }
