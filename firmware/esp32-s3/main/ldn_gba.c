@@ -144,6 +144,20 @@ bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8])
     return gba_relay_get_gba_identity(tid, name8);
 }
 
+bool ldn_pico_get_gba_activity(uint8_t *activity, uint8_t *started, uint16_t *trade_word)
+{
+    gba_relay_room_info_t ri;
+    gba_relay_get_room_info(&ri);
+    if (!ri.broadcast_seen) return false;
+    /* broadcast_activity is RfuGameData gname[10] = activity:7 | startedActivity:1, captured
+     * verbatim from the cart's 0x16 (observed 0x84 = ACTIVITY_TRADE | started on a real JP cart).
+     * tradeSpecies:10|tradeType:6 sits two bytes earlier, in broadcast_raw[2]'s low half. */
+    if (activity)   *activity = (uint8_t)(ri.broadcast_activity & 0x7Fu);
+    if (started)    *started  = (uint8_t)((ri.broadcast_activity >> 7) & 1u);
+    if (trade_word) *trade_word = (uint16_t)(ri.broadcast_raw[2] & 0xFFFFu);
+    return true;
+}
+
 void ldn_pico_gba_bcast_dbg(uint32_t out6[6], uint32_t *seen)
 {
     gba_relay_room_info_t ri;

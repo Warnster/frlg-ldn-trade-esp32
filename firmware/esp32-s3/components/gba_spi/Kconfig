@@ -30,6 +30,20 @@ config GBA_SPI_BUS_PROBE
         traffic stall a core-1 GPIO read past the 250ns half-bit budget? No GBA needs to be
         connected. Mutually exclusive with the other GBA_SPI_* selftests. Leave OFF normally.
 
+config GBA_SPI_CLOCK_MASTER
+    bool "Take the SIO clock on a role-change ack (trade data phase)"
+    default n
+    help
+        The RFU clock role swaps: acking 0x25/0x27/0x35/0x37 with the correct cmd|0x80 ack
+        (A5/A7/B5/B7) puts the GBA into clock-slave mode, after which it STOPS DRIVING SC and
+        waits for the adapter to clock the link. With this OFF the transport keeps sending the
+        legacy (wrong but harmless) 0xA8 ack and never takes the clock — the GBA stays clock
+        master, which is what every run so far has used. With it ON the adapter sends the correct
+        ack and drives SC itself via the dedicated-GPIO clock-master path.
+        These two must change together: the correct ack without clock-master drive silences the
+        link permanently, and clock-master drive without the correct ack never gets the role.
+        UNPROVEN ON HARDWARE — this is the gate for the trade DATA phase. Turn on to test it.
+
 config GBA_SPI_MODE
     int "SPI slave mode (0-3) for the GBA link"
     default 3

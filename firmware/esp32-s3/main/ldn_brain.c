@@ -96,10 +96,27 @@ int ldn_brain_start(const uint8_t ssid[16], const uint8_t our_ip[4], const uint8
                    gtid, gname8[0], gname8[1], gname8[2], gname8[3],
                    gname8[4], gname8[5], gname8[6], gname8[7]);
         }
+        /* Advertise the activity the cartridge is ACTUALLY doing, rather than hardcoding trade.
+         * FRLG's Direct-Corner entry path for a Colosseum battle is nearly identical to trade
+         * (same warp/cable-club machinery, different destination map), and in this relay the two
+         * real games supply all the game logic — so carrying the cart's own activity byte through
+         * is what lets anything other than a trade be advertised correctly to the Switch.
+         * Falls back to sim.c's NI_ACTIVITY_TRADE default when the GBA hasn't broadcast yet. */
+        uint8_t gact = 0, gstarted = 0; uint16_t gtrade = 0;
+        if (ldn_pico_get_gba_activity(&gact, &gstarted, &gtrade) && gact) {
+            s_engine.ni_activity = gact;
+            s_engine.ni_started  = gstarted;
+            printf("LDN_BRAIN activity=0x%02x started=%u trade_word=0x%04x (%s)\n",
+                   gact, gstarted, gtrade,
+                   gact == 0x04 ? "TRADE" : gact == 0x01 ? "BATTLE_SINGLE" :
+                   gact == 0x02 ? "BATTLE_DOUBLE" : gact == 0x05 ? "CHAT" : "other");
+        }
     }
     s_engine.in_seat_phase = 0;
     s_engine.established = 0;
-    s_engine.ni_started = 1;
+    /* Default only — the cartridge's own broadcast (above) overrides it when available. Must not
+     * clobber that, so only set it if the activity plumbing didn't already decide. */
+    if (!s_engine.ni_activity) s_engine.ni_started = 1;
 
     uint8_t connect_id[2];
     esp_fill_random(connect_id, sizeof(connect_id));

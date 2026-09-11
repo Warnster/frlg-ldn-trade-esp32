@@ -146,6 +146,7 @@ volatile uint32_t g_gba_skips;   /* idle/non-0x9966 frames skipped while waiting
 volatile uint32_t g_cmd_resyncs; /* times cmd_resync() recovered a single-bit slip without a full re-login */
 volatile uint32_t g_word_resyncs; /* times a bad header self-corrected on the VERY NEXT aligned word —
                                     * no bit-shifting, no relogin, just one extra transfer (round 5 fix) */
+volatile uint32_t g_clock_master_swaps;  /* times we took the clock on a role-change ack */
 volatile uint32_t g_login_rx[16], g_login_n;   /* rolling record of login challenge words core1 reads */
 
 /* ---- command-loop trace (temporary) — every xfer_word tx/rx pair in the command phase, rolling.
@@ -744,11 +745,30 @@ void IRAM_ATTR gba_spi_core1_entry(void)
 
             uint32_t dummy;
             if (act == GBA_WAP_ASYNC_ACK) {
+#if CONFIG_GBA_SPI_CLOCK_MASTER
+                /* CORRECT protocol (decomp: librfu_intr.c) — ack the command the GBA actually sent
+                 * (cmd|0x80 => A5/A7/B5/B7) with NO trailing word, then TAKE THE CLOCK: that ack is
+                 * exactly what sets the GBA's msMode = AGB_CLK_SLAVE, after which it stops driving
+                 * SC and waits for us. Enabled together, because either alone breaks the link. */
+                uint32_t tx1 = gba_wap_response_header(gba_wap_header(cmd, 0));
+                g_cp = 3;
+                xfer_word(tx1, &dummy); cmd_trace_push('a', tx1, dummy);
+                g_clock_master_swaps++;
+                gba_spi_clock_master_acquire();
+                /* Clock out one idle word as master so the GBA's slave-side DMA completes, then
+                 * hand the clock straight back. This is the minimal, conservative handoff — the
+                 * full data-phase exchange belongs here once this much is proven on hardware. */
+                g_cp = 4;
+                uint32_t mrx = gba_spi_master_xfer_word(IDLE_WORD);
+                cmd_trace_push('M', IDLE_WORD, mrx);
+                gba_spi_clock_master_release();
+#else
                 uint32_t tx1 = gba_wap_header(0xa8, 0);
                 g_cp = 3;
                 xfer_word(tx1, &dummy); cmd_trace_push('a', tx1, dummy);
                 g_cp = 4;
                 xfer_word(IDLE_WORD, &dummy); cmd_trace_push('i', IDLE_WORD, dummy);
+#endif
             } else {
                 uint32_t tx1 = gba_wap_response_header(gba_wap_header(cmd, (uint8_t)rn));
                 g_cp = 5;

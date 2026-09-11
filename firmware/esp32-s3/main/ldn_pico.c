@@ -57,6 +57,9 @@ void ldn_pico_set_peer_identity(uint16_t tid, const uint8_t name8[8])
  * default join name. (Single-chip ldn_gba.c decodes it via gba_relay.) */
 bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8]) { (void)tid; (void)name8; return false; }
 void ldn_pico_gba_bcast_dbg(uint32_t out6[6], uint32_t *seen) { for (int i=0;i<6;i++) out6[i]=0; if (seen) *seen=0; }
+/* Two-chip path: the 0x16 RfuGameData isn't decoded from the UART stream — fall back to the
+ * built-in default activity. (Single-chip ldn_gba.c decodes it via gba_relay.) */
+bool ldn_pico_get_gba_activity(uint8_t *a, uint8_t *s, uint16_t *t) { (void)a; (void)s; (void)t; return false; }
 /* Same GBA beacon build + checksum as the single-chip path (see ldn_gba.c build_gba_beacon). */
 static void build_gba_beacon(uint16_t tid, const uint8_t name8[8], uint32_t beacon6[6])
 {
