@@ -168,7 +168,19 @@ static inline void ni_reset(void) {
     s_child_ack_pending = false;
 }
 
-/* Emit the current NI subframe (3-byte parent LLSF + payload) into b; returns byte count. */
+/* Emit the current NI subframe (3-byte parent LLSF + payload) into b; returns byte count.
+ *
+ * 2026-09-12: no longer waits for ni_scan_child to see a matching ack before advancing. Hardware
+ * evidence (full command trace, docs/28) shows the ack-gated design never once advanced past
+ * stage 0 in 5+ runs — the child's only observed reply never matches any of our 5 subframes'
+ * (state,n,phase) — and yet the cart clearly treats the exchange as progressing: by the SECOND
+ * post-wake round it's already sending what looks like a real 14-byte RFUCMD game slot, not
+ * another NI reply. RFU's parent->child direction is a reliable, in-order, one-slot-per-VBlank
+ * channel (the same property the whole project's slot-relay design already leans on) — so instead
+ * of policing an ack format we may be misreading, just advance one subframe per 0x26 pull and
+ * trust the channel, matching pokeldn's ParentNISender.next_slot() (which advances unconditionally
+ * on each call, no ack-content check). The child's actual ack (if any) is still scanned and
+ * counted (s_ni_acks) for visibility, but no longer gates advancement. */
 static IRAM_ATTR int ni_emit_current(uint8_t *b)
 {
     const ni_subframe_t *f = &s_ni_seq[s_ni_stage];
@@ -179,6 +191,8 @@ static IRAM_ATTR int ni_emit_current(uint8_t *b)
     if (f->state == NI_LCOM_NULL) {
         /* terminal NULL is unacknowledged — serve it a couple of times, then NI is done */
         if (++s_ni_null_served >= 3) s_ni_stage = 5;
+    } else if (s_ni_stage < 4) {
+        s_ni_stage++;   /* advance unconditionally — see comment above */
     }
     return 3 + f->size;
 }
@@ -221,12 +235,11 @@ static IRAM_ATTR void ni_scan_child(const uint32_t *data, int len)
         s_ni_child_frames++;
         s_ni_last_hw = h;
         if (ack) {
+            /* Diagnostic only now — ni_emit_current advances unconditionally (see its comment).
+             * Still counted so a future run can show whether the child's ack ever DOES line up. */
             if (s_ni_stage < 5) {
                 const ni_subframe_t *cur = &s_ni_seq[s_ni_stage];
-                if (state == cur->state && n == cur->n && phase == cur->phase) {
-                    s_ni_acks++;
-                    if (s_ni_stage < 4) s_ni_stage++;      /* NULL advances via ni_emit_current */
-                }
+                if (state == cur->state && n == cur->n && phase == cur->phase) s_ni_acks++;
             }
         } else if (state == NI_LCOM_START || state == NI_LCOM_NI || state == NI_LCOM_END) {
             s_child_ack_state = state; s_child_ack_n = n; s_child_ack_phase = phase;
