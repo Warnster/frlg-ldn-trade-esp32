@@ -1083,9 +1083,25 @@ static void run_private_join(void)
                  * readback 0x996600A8/A7 (fully accepted); wto = idle-timeout (0x27) wakes;
                  * abort = waits abandoned because the GBA re-took SC; hsfb = missed SO handshake
                  * responses (blind-settle fallback used). */
+                /* One-shot word-level trace dump on a MID-SESSION reset (cmds>50): prints the
+                 * last 128 tx/rx pairs core1 recorded — the exact story of the desync, so live
+                 * runs stop being single-counter guessing games. Tags: H=hdr h=retry D=data
+                 * R=resp o=resp-data a=ack i=idle W/K=wake words r=hdr-rescue X=resync M=master. */
+                if (g_rsnap_flag) {
+                    /* FROZEN core1 snapshot from the reset instant (not the live ring, which has
+                     * long since wrapped with the next session's browse traffic). */
+                    char line[1600]; int off = 0;
+                    off += snprintf(line, sizeof(line), "RESET SNAP @cmd%u rst=%08x n=%u (oldest first):",
+                                    (unsigned)g_rsnap_cmd, (unsigned)g_rsnap_rst, (unsigned)g_rsnap_n);
+                    for (uint32_t k = 0; k < g_rsnap_n && off < (int)sizeof(line) - 24; k++)
+                        off += snprintf(line + off, sizeof(line) - off, " %c[%08x/%08x]",
+                                        g_rsnap_tag[k], (unsigned)g_rsnap_tx[k], (unsigned)g_rsnap_rx[k]);
+                    printf("%s\n", line);
+                    g_rsnap_flag = 0;
+                }
                 printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u"
                        " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x clkmaster=%u"
-                       " wake=%u armed=%u wacks=%u wto=%u abort=%u hsfb=%u ackrx=%08x hdrrx=%08x\n",
+                       " wake=%u armed=%u wacks=%u wto=%u abort=%u hsfb=%u ackrx=%08x hdrrx=%08x ni=%u/%u/%u c24=%u lk=%u/%u/%u/%u/%u rst=%08x@%u rsq=%u chw=%04x\n",
                        (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
                        (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
                        (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
@@ -1096,7 +1112,11 @@ static void run_private_join(void)
                        (unsigned)g_gba_last_cmd, (unsigned)g_clock_master_swaps,
                        (unsigned)g_wake_words, (unsigned)g_wake_armed, (unsigned)g_wake_acks,
                        (unsigned)g_wake_timeouts, (unsigned)g_wait_aborts, (unsigned)g_hs_fallbacks,
-                       (unsigned)g_parent_ack_last, (unsigned)g_parent_hdr_rx);
+                       (unsigned)g_parent_ack_last, (unsigned)g_parent_hdr_rx,
+                       (unsigned)gba_relay_ni_stage(), (unsigned)gba_relay_ni_acks(), (unsigned)gba_relay_ni_childf(),
+                       (unsigned)gba_relay_cmd_count(0x24),
+                       (unsigned)g_gba_logins, (unsigned)g_gba_resets, (unsigned)g_cmd_resyncs,
+                       (unsigned)g_word_resyncs, (unsigned)g_gba_skips, (unsigned)g_gba_last_reset, (unsigned)g_reset_cmd, (unsigned)g_hdr_rescues, (unsigned)gba_relay_ni_lasthw());
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);
                 printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",

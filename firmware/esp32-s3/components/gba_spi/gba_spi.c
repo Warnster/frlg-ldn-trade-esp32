@@ -153,6 +153,14 @@ volatile uint32_t g_clock_master_swaps;   /* times we took the clock on a role-c
 volatile uint32_t g_wake_words;           /* 2-word wake notifications clocked (0x99660028/27) */
 volatile uint32_t g_wake_armed;           /* of those, word-1 readback == 0x80000000 = GBA WAS armed */
 volatile uint32_t g_wake_acks;            /* of those, word-2 readback == 0x996600A8/A7 = fully accepted */
+volatile uint32_t g_hdr_rescues;          /* missed-0x26-header recoveries (bare 0x80000000 read as header) */
+
+/* Frozen copy of the trace ring taken ON CORE1 AT THE INSTANT of a mid-session reset — the live
+ * ring wraps in ~0.5s of browse traffic, so a core0 dump up to 2s later prints the NEXT session
+ * (2026-09-12 run 02:22 lesson). One-shot: armed until core0 prints and clears the flag. */
+volatile uint8_t  g_rsnap_tag[GBA_SPI_CMD_TRACE_N];
+volatile uint32_t g_rsnap_tx[GBA_SPI_CMD_TRACE_N], g_rsnap_rx[GBA_SPI_CMD_TRACE_N];
+volatile uint32_t g_rsnap_n, g_rsnap_flag, g_rsnap_rst, g_rsnap_cmd;
 volatile uint32_t g_wake_timeouts;        /* wakes sent as 0x99660027 (idle timeout, no fresh slot) */
 volatile uint32_t g_wait_aborts;          /* waits abandoned because the GBA re-took the clock (SC high) */
 volatile uint32_t g_hs_fallbacks;         /* inverted-handshake SO responses that never came (blind settle used) */
@@ -173,6 +181,22 @@ static IRAM_ATTR void cmd_trace_push(uint8_t tag, uint32_t tx, uint32_t rx)
     uint32_t i = g_cmd_trace_n & (CMD_TRACE_N - 1);
     g_cmd_trace_tag[i] = tag; g_cmd_trace_tx[i] = tx; g_cmd_trace_rx[i] = rx;
     g_cmd_trace_n++;
+}
+
+static IRAM_ATTR void reset_snapshot(uint32_t rstval)
+{
+    if (g_rsnap_flag || g_gba_cmds <= 20) return;      /* one-shot; skip menu-phase resets */
+    uint32_t n = g_cmd_trace_n;
+    uint32_t cnt = (n > GBA_SPI_CMD_TRACE_N) ? GBA_SPI_CMD_TRACE_N : n;
+    uint32_t start = n - cnt;
+    for (uint32_t k2 = 0; k2 < cnt; k2++) {
+        uint32_t i2 = (start + k2) & (GBA_SPI_CMD_TRACE_N - 1);
+        g_rsnap_tag[k2] = g_cmd_trace_tag[i2];
+        g_rsnap_tx[k2]  = g_cmd_trace_tx[i2];
+        g_rsnap_rx[k2]  = g_cmd_trace_rx[i2];
+    }
+    g_rsnap_n = cnt; g_rsnap_rst = rstval; g_rsnap_cmd = g_gba_cmds;
+    g_rsnap_flag = 1;
 }
 
 /* Whitelist of every command byte we've actually seen the GBA send in the lobby (login-table-adjacent
@@ -287,6 +311,16 @@ void gba_spi_init(void)
      * before it). The RP2040 additionally has Schmitt-trigger hysteresis on by default; the S3 has
      * none at all (not available on this silicon), so a defined disconnect level matters MORE here,
      * not less. ~45k internal pull — negligible load on the GBA's drive. */
+    /* REVERTED 2026-09-12 (run 02:34): SC pull-up was an unconfirmed fix for the data-phase
+     * handback float; it did NOT solve that (RESET SNAPs since still show desyncs), and it landed
+     * on the SAME pin as docs/17's proven 9,278-clean-command browse-phase run, which used a
+     * pulldown. Two RESET SNAPs post-revert-worthy evidence both showed the desync happening in
+     * plain BroadcastReadPoll (0x1d) browsing, BEFORE Connect — i.e. in the phase that was rock
+     * solid before tonight. The release path (gba_spi_clock_master_release) already drives SC
+     * explicitly HIGH before disabling output, so the passive pull was never load-bearing for the
+     * handback anyway — only for the brief real float, which pulldown handled fine for 9,278
+     * commands. Back to pulldown as the proven baseline; the handback float theory needs the
+     * sniffer, not another blind pull-direction guess. */
     gpio_config_t in = {
         .pin_bit_mask = SC_MASK | SO_MASK | (1ULL << GBA_SD_PIN),
         .mode = GPIO_MODE_INPUT, .pull_up_en = 0, .pull_down_en = 1, .intr_type = GPIO_INTR_DISABLE,
@@ -755,7 +789,26 @@ void IRAM_ATTR gba_spi_core1_entry(void)
             g_cp = 1;
             bool hok = xfer_word(IDLE_WORD, &hdr);
             cmd_trace_push('H', IDLE_WORD, hdr);
-            if (!hok) { g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; break; }
+            if (hok && hdr == 0x80000000u) {
+                /* MISSED-HEADER RECOVERY (2026-09-12, rst=80000000@N repeatable): after the wake,
+                 * the GBA fires ReceiveData(0x26) so fast that its header word sometimes lands
+                 * before we're back in the loop — we then catch word 2, the bare 0x80000000
+                 * response-request, perfectly aligned. A lone 0x80000000 is never a valid header,
+                 * and post-wake the child sends ONLY 0x26 — so reconstruct the transaction:
+                 * serve the 0x26 ack + parent frame right here instead of resetting to login
+                 * (which killed the session five times in run 02:10). */
+                uint32_t out26[24];
+                int rn26 = (io->take_frame) ? io->take_frame(out26, 24, io->ctx)
+                                            : (io->take_slot ? io->take_slot(out26, 8, io->ctx) : 0);
+                uint32_t dummy26;
+                uint32_t tx26 = 0x99660000u | ((uint32_t)rn26 << 8) | 0xA6u;
+                xfer_word(tx26, &dummy26); cmd_trace_push('r', tx26, dummy26);
+                for (int i = 0; i < rn26; i++) { xfer_word(out26[i], &dummy26); cmd_trace_push('o', out26[i], dummy26); }
+                g_hdr_rescues++;
+                g_gba_cmds++; g_gba_last_cmd = 0x26;
+                continue;
+            }
+            if (!hok) { reset_snapshot(1); g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; break; }
             if (!gba_wap_header_valid(hdr)) {
                 /* 2026-09-10 fix, round 5: a sniffer capture caught the ACTUAL failure mode live —
                  * a single bit misread on the wire (0x9966001a -> 0x9d66001a, ONE bit different),
@@ -788,7 +841,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     uint32_t resynced = 0;
                     g_cp = 0x10;
                     if (cmd_resync(&resynced)) { g_cmd_resyncs++; hdr = resynced; cmd_trace_push('X', 0, hdr); }
-                    else { g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; break; }
+                    else { reset_snapshot(hdr); g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; break; }
                 }
             }
             if (gba_wap_is_response(gba_wap_cmd(hdr))) {
@@ -922,15 +975,20 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     uint32_t w2 = gba_spi_hwmaster_xfer_word(0x80000000u);  /* rx 0x996600A8/A7 */
                     g_parent_ack_last = w2;
                     cmd_trace_push('K', 0x80000000u, w2);
-                    gba_spi_hwmaster_si_gpio();                          /* latch = LOW */
-                    esp_rom_delay_us(1000);                               /* final ISR entry gate */
-                    SI_HIGH();                                           /* state 8 -> GBA restores master */
-                    /* NO trailing hold: the instant the GBA leaves state 8 its game fires the
-                     * follow-up ReceiveData(0x26) AT US as master — run 01:17 proved a leftover
-                     * 1ms epilogue left us deaf to it (wacks=1 but recv26=0 -> GBA gave up, Bye,
-                     * restarted its session). Restore pins + release + get back to the slave
-                     * command loop within microseconds. */
-                    gba_spi_hwmaster_pins_give();
+                    /* FINAL EPILOGUE — two hardware-found rules (runs 01:17 + 01:51):
+                     * 1. The word-2 ISR ENTRY gate needs SI LOW — and si_gpio() restores the GPIO
+                     *    latch, which the inter-word gate left HIGH. Run 01:51: our "low hold" was
+                     *    actually holding HIGH -> the GBA's ISR never entered, its 100ms timer
+                     *    killed the link, no 0x26 ever came. Drive LOW explicitly.
+                     * 2. The child fires ReceiveData(0x26) FROM the ISR-completion callback — the
+                     *    instant we raise the final SI-high. So the clock must already be handed
+                     *    back and we must fall straight into the command loop after that edge. */
+                    gba_spi_hwmaster_si_gpio();
+                    SI_LOW();                                            /* ISR ENTRY gate — for real */
+                    esp_rom_delay_us(1000);                              /* held: ISR arrival + state 8 */
+                    gba_spi_hwmaster_pins_give();                        /* SC back to dedic (still high) */
+                    gba_spi_clock_master_release();                      /* GBA owns SC again */
+                    SI_HIGH();                                           /* state 8 completes -> callback fires 0x26 NOW */
 #else
                     uint32_t w1 = gba_spi_master_xfer_word(wake);
                     g_parent_hdr_rx = w1;
@@ -942,8 +1000,10 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     cmd_trace_push('K', 0x80000000u, w2);
                     SI_LOW();  esp_rom_delay_us(1000);
                     SI_HIGH();
+#if !CONFIG_GBA_SPI_HW_MASTER
+                    gba_spi_clock_master_release();  /* bit-bang path: release after the final gate */
 #endif
-                    gba_spi_clock_master_release();  /* GBA restores clock-master, then pulls via 0x26 */
+#endif
                     g_wake_words++;
                     if (w1 == 0x80000000u) g_wake_armed++;
                     if (w2 == (0x99660080u | (wake & 0xFFu))) g_wake_acks++;   /* 0x996600A8 / ..A7 */

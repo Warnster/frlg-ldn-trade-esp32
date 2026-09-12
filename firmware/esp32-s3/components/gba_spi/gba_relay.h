@@ -103,6 +103,14 @@ bool gba_relay_get_gba_identity(uint16_t *tid, uint8_t name8[8]);
  * wake-up notification — see gba_relay_take_parent_frame (docs/22). */
 int gba_relay_build_parent_frame(uint32_t *out, int max_words);
 
+/* Join-status NI sender diagnostics (docs/23): stage 0-4 = serving that subframe of the
+ * JOIN_GROUP_OK sequence, 5 = NI complete (UNI streaming); acks = child LLSF acks consumed;
+ * childf = child LLSF subframes seen in its sends. */
+uint32_t gba_relay_ni_stage(void);
+uint32_t gba_relay_ni_acks(void);
+uint32_t gba_relay_ni_childf(void);
+uint32_t gba_relay_ni_lasthw(void);   /* raw halfword of last child LLSF subframe (decode check) */
+
 /* ---- core1-side data-phase helpers (docs/22 wake-word model) ----
  * fresh():        peek-only — has core0 published a Switch slot not yet consumed? The clock-master
  *                 wait loop polls this to decide when to send the 0x99660028 wake word.

@@ -103,11 +103,101 @@ static IRAM_ATTR int gba_relay_take_frame_cb(uint32_t *out, int max, void *ctx)
     return gba_relay_take_parent_frame(out, max);
 }
 
+/* ---- parent join-status NI sender (docs/23 §next, 2026-09-12) --------------------------------
+ * THE missing piece of the trade-room join (pokefirered link_rfu_2.c:446 Task_ChildSearchForParent
+ * RFUSTATE_CHILD_TRY_JOIN): after Connect the child polls GetJoinGroupStatus() and proceeds ONLY
+ * once the PARENT has sent a 1-byte NI containing RFU_STATUS_JOIN_GROUP_OK (parent side:
+ * rfu_NI_setSendData(slot, 8, &status, 1), link_rfu_2.c:1680). Without it the child times out and
+ * takes the clock-change + disconnect path — the exact Bye/crash observed. Wire format ported
+ * from pokeldn ni.py ParentNISender + _ni_send_sequence (hardware-proven): subFrameSize 8, parent
+ * LLSF header 3 bytes -> payloadSize 5, NI header = dataType(0) + payloadSize(u16 LE) +
+ * dataSize(u32 LE) = 7 bytes chunked over two NI_STARTs, then the status byte, then END + NULL:
+ *   1. NI_START n=1 ph=0 size=5 : 00 05 00 01 00
+ *   2. NI_START n=2 ph=0 size=2 : 00 00
+ *   3. NI      n=1 ph=0 size=1 : 05           (RFU_STATUS_JOIN_GROUP_OK)
+ *   4. NI_END  n=0 ph=0 size=0
+ *   5. NULL    n=1 ph=0 size=0                (terminal — the child does NOT ack it)
+ * Each subframe is served in every parent frame until the child's librfu auto-ack (child LLSF,
+ * ack=1, matching state/n/phase — rfu_STC_NI_receive) arrives in its SendData; then advance.
+ * Parent LLSF: (state&0xF)<<14 | ack<<13 | (n&3)<<11 | (phase&3)<<9 | (bmSlot&0xF)<<18 | size&0x7F,
+ * 3 bytes LE (pokeldn rfu.py _parent_llsf). bm_slot=1 (single child). */
+#define NI_LCOM_NULL  0
+#define NI_LCOM_START 1
+#define NI_LCOM_NI    2
+#define NI_LCOM_END   3
+typedef struct { uint8_t state, n, phase, size; uint8_t pay[5]; } ni_subframe_t;
+static const ni_subframe_t s_ni_seq[5] = {
+    { NI_LCOM_START, 1, 0, 5, {0x00, 0x05, 0x00, 0x01, 0x00} },
+    { NI_LCOM_START, 2, 0, 2, {0x00, 0x00} },
+    { NI_LCOM_NI,    1, 0, 1, {0x05} },                          /* JOIN_GROUP_OK */
+    { NI_LCOM_END,   0, 0, 0, {0} },
+    { NI_LCOM_NULL,  1, 0, 0, {0} },
+};
+/* core1-owned NI progress (written in put_slot/take_frame, both core1) + core0-readable diags */
+static volatile uint32_t s_ni_stage;        /* 0..4 = serving s_ni_seq[stage]; >=5 = NI done -> UNI */
+static volatile uint32_t s_ni_acks;         /* child acks consumed */
+static volatile uint32_t s_ni_child_frames; /* child LLSF subframes seen in its sends */
+static volatile uint32_t s_ni_null_served;  /* how many times the terminal NULL went out */
+static volatile uint32_t s_ni_last_hw;      /* raw halfword of the LAST child LLSF subframe seen */
+
+uint32_t gba_relay_ni_stage(void)  { return s_ni_stage; }
+uint32_t gba_relay_ni_acks(void)   { return s_ni_acks; }
+uint32_t gba_relay_ni_childf(void) { return s_ni_child_frames; }
+uint32_t gba_relay_ni_lasthw(void) { return s_ni_last_hw; }
+
+static inline void ni_reset(void) { s_ni_stage = 0; s_ni_acks = 0; s_ni_null_served = 0; }
+
+/* Emit the current NI subframe (3-byte parent LLSF + payload) into b; returns byte count. */
+static IRAM_ATTR int ni_emit_current(uint8_t *b)
+{
+    const ni_subframe_t *f = &s_ni_seq[s_ni_stage];
+    uint32_t llsf = ((uint32_t)(f->state & 0xF) << 14) | ((uint32_t)(f->n & 3) << 11)
+                  | ((uint32_t)(f->phase & 3) << 9) | ((uint32_t)1 << 18) | (f->size & 0x7Fu);
+    b[0] = (uint8_t)llsf; b[1] = (uint8_t)(llsf >> 8); b[2] = (uint8_t)(llsf >> 16);
+    for (int i = 0; i < f->size; i++) b[3 + i] = f->pay[i];
+    if (f->state == NI_LCOM_NULL) {
+        /* terminal NULL is unacknowledged — serve it a couple of times, then NI is done */
+        if (++s_ni_null_served >= 3) s_ni_stage = 5;
+    }
+    return 3 + f->size;
+}
+
+/* Scan a child send (0x24/0x25 payload words) for child LLSF subframes and advance the NI machine
+ * on a matching ack. Child LLSF halfword (pokeldn rfu.py child fields, LE):
+ *   size:5 (b0-4) | phase:2 (b5-6) | n:2 (b7-8) | ack:1 (b9) | state:4 (b10-13) */
+static IRAM_ATTR void ni_scan_child(const uint32_t *data, int len)
+{
+    if (s_ni_stage >= 5 || len <= 0) return;
+    const uint8_t *p = (const uint8_t *)data;
+    int nbytes = len * 4;
+    int off = 0;
+    while (off + 2 <= nbytes) {
+        uint16_t h = (uint16_t)(p[off] | (p[off + 1] << 8));
+        if (h == 0) break;                       /* zero padding — no more subframes */
+        uint8_t size  = h & 0x1F;
+        uint8_t phase = (h >> 5) & 3;
+        uint8_t n     = (h >> 7) & 3;
+        uint8_t ack   = (h >> 9) & 1;
+        uint8_t state = (h >> 10) & 0xF;
+        s_ni_child_frames++;
+        s_ni_last_hw = h;
+        if (ack) {
+            const ni_subframe_t *cur = &s_ni_seq[s_ni_stage];
+            if (state == cur->state && n == cur->n && phase == cur->phase) {
+                s_ni_acks++;
+                if (s_ni_stage < 4) s_ni_stage++;          /* NULL advances via ni_emit_current */
+            }
+        }
+        off += 2 + size;
+    }
+}
+
 static IRAM_ATTR void gba_relay_put_slot_cb(const uint32_t *data, int len, void *ctx)
 {
     (void)ctx;
     if (len > GBA_RELAY_SLOT_WORDS) len = GBA_RELAY_SLOT_WORDS;
     if (len < 0) len = 0;
+    ni_scan_child(data, len);                    /* NI-phase: consume the child's LLSF acks */
     for (int i = 0; i < len; i++) s_relay.gba_slot[i] = data[i];
     atomic_store_explicit(&s_relay.gba_slot_len, (uint32_t)len, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_relay.gba_slot_seq, 1, memory_order_release);
@@ -121,7 +211,10 @@ static IRAM_ATTR void gba_relay_on_raw_command_cb(uint8_t cmd, const uint32_t *d
      * edge-detection ("did it change?"), never for ordering against payload data. */
     atomic_fetch_add_explicit(&s_relay.wap_seen, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_relay.cmd_hist[cmd], 1, memory_order_relaxed);
-    if (cmd == GBA_CMD_CONNECT)   atomic_fetch_add_explicit(&s_relay.connect_seen, 1, memory_order_relaxed);
+    if (cmd == GBA_CMD_CONNECT) {
+        atomic_fetch_add_explicit(&s_relay.connect_seen, 1, memory_order_relaxed);
+        ni_reset();                       /* fresh join attempt -> restart the join-status NI */
+    }
     if (cmd == GBA_CMD_SEND_DATA_WAIT) atomic_fetch_add_explicit(&s_relay.send_seen, 1, memory_order_relaxed);
     if (cmd == GBA_CMD_SETUP && len >= 1) {
         uint8_t role = (uint8_t)(data[0] >> 16);
@@ -279,6 +372,23 @@ uint32_t IRAM_ATTR gba_relay_wait_timeout_us(void)
 int IRAM_ATTR gba_relay_take_parent_frame(uint32_t *out, int max_words)
 {
     if (max_words < 1) return 0;
+    /* NI PHASE FIRST (see the sender above): until the child has acked the whole join-status NI
+     * sequence, every parent frame carries the current NI subframe — this is what moves the GBA
+     * out of RFUSTATE_CHILD_TRY_JOIN. Only after that do we stream UNI frames. */
+    if (s_ni_stage < 5) {
+        uint8_t b[8];
+        int nb = ni_emit_current(b);
+        out[0] = (uint32_t)nb & 0x7Fu;                       /* 0x26 count header: bytes from host */
+        int nw = (nb + 3) / 4;
+        for (int i = 0; i < nw && 1 + i < max_words; i++) {
+            int o = i * 4;
+            out[1 + i] = (uint32_t)b[o]
+                       | ((o + 1 < nb) ? ((uint32_t)b[o + 1] << 8)  : 0)
+                       | ((o + 2 < nb) ? ((uint32_t)b[o + 2] << 16) : 0)
+                       | ((o + 3 < nb) ? ((uint32_t)b[o + 3] << 24) : 0);
+        }
+        return 1 + nw;
+    }
     /* A REAL parent streams its UNI frame every frame from the moment the child connects — a
      * zero gRecvCmds table means "parent alive, no commands yet", NOT "no data". The old
      * count=0 reply told the game its partner had nothing, and the game (correctly) Bye'd.
