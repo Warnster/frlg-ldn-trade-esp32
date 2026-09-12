@@ -3,5 +3,6 @@
 idf_component_register(
     SRCS
         "gba_packet.c"
+        "gba_block.c"
     INCLUDE_DIRS "."
 )
