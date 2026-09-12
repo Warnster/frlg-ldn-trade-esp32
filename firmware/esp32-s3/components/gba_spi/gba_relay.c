@@ -171,7 +171,7 @@ static inline void ni_reset(void) {
 /* Emit the current NI subframe (3-byte parent LLSF + payload) into b; returns byte count.
  *
  * 2026-09-12: no longer waits for ni_scan_child to see a matching ack before advancing. Hardware
- * evidence (full command trace, docs/28) shows the ack-gated design never once advanced past
+ * evidence (full command trace, docs/27) shows the ack-gated design never once advanced past
  * stage 0 in 5+ runs — the child's only observed reply never matches any of our 5 subframes'
  * (state,n,phase) — and yet the cart clearly treats the exchange as progressing: by the SECOND
  * post-wake round it's already sending what looks like a real 14-byte RFUCMD game slot, not
