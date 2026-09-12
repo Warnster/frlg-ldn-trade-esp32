@@ -162,6 +162,19 @@ volatile uint8_t  g_rsnap_tag[GBA_SPI_CMD_TRACE_N];
 volatile uint32_t g_rsnap_tx[GBA_SPI_CMD_TRACE_N], g_rsnap_rx[GBA_SPI_CMD_TRACE_N];
 volatile uint32_t g_rsnap_n, g_rsnap_flag, g_rsnap_rst, g_rsnap_cmd;
 volatile uint32_t g_wake_timeouts;        /* wakes sent as 0x99660027 (idle timeout, no fresh slot) */
+/* docs/26 Phase 0: one-shot capture of the raw words the GBA clocks at us RIGHT AFTER the first
+ * wake, to answer "does the GBA's RECV_DATA(0x26) even reach the wire?". g_pw_rx = the words;
+ * g_pw_dt = ccount() since the wake completed (so we see the latency). g_pw_done latches after the
+ * buffer fills so only the FIRST wake's aftermath is captured (clean, non-wrapping). GBA_PW_N in
+ * gba_spi.h. */
+volatile uint32_t g_pw_rx[GBA_PW_N], g_pw_dt[GBA_PW_N], g_pw_n, g_pw_t0;
+volatile uint8_t  g_pw_arm, g_pw_done;
+/* 2026-09-12: does a hard reset correlate with REPEATED wake/pin-mux cycles rather than the first
+ * one? Captured alongside g_reset_cmd at every reset site: g_wake_words' value AT THE INSTANT of
+ * the reset, so "reset happened after N wake cycles this boot" is directly readable (today's crash
+ * landed at cmd118, well past the first wake at ~cmd101 — this makes that precise instead of
+ * inferred from two separate CMD_HIST prints). */
+volatile uint32_t g_reset_wake_count;
 volatile uint32_t g_wait_aborts;          /* waits abandoned because the GBA re-took the clock (SC high) */
 volatile uint32_t g_hs_fallbacks;         /* inverted-handshake SO responses that never came (blind settle used) */
 volatile uint32_t g_parent_ack_last;      /* raw word-2 readback (expect 0x996600A8) — the diagnosis */
@@ -547,6 +560,12 @@ static IRAM_ATTR bool xfer_word(uint32_t tx, uint32_t *rx_word)
         if (LINK_SO(LINK_IN())) { if (++arun >= LINK_DEBOUNCE) break; }
         else { arun = 0; if (++ag > WORD_START_GIVEUP) { return false; } }
     }
+    if (g_pw_arm && g_pw_n < GBA_PW_N) {           /* docs/26 Phase 0: capture post-wake words */
+        g_pw_dt[g_pw_n] = ccount() - g_pw_t0;
+        g_pw_rx[g_pw_n] = rx;
+        g_pw_n++;
+        if (g_pw_n >= GBA_PW_N) { g_pw_arm = 0; g_pw_done = 1; }
+    }
     if (rx_word) *rx_word = rx;
     return true;                                   /* SI left HIGH (idle) */
 }
@@ -808,7 +827,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                 g_gba_cmds++; g_gba_last_cmd = 0x26;
                 continue;
             }
-            if (!hok) { reset_snapshot(1); g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; break; }
+            if (!hok) { reset_snapshot(1); g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; break; }
             if (!gba_wap_header_valid(hdr)) {
                 /* 2026-09-10 fix, round 5: a sniffer capture caught the ACTUAL failure mode live —
                  * a single bit misread on the wire (0x9966001a -> 0x9d66001a, ONE bit different),
@@ -841,7 +860,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     uint32_t resynced = 0;
                     g_cp = 0x10;
                     if (cmd_resync(&resynced)) { g_cmd_resyncs++; hdr = resynced; cmd_trace_push('X', 0, hdr); }
-                    else { reset_snapshot(hdr); g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; break; }
+                    else { reset_snapshot(hdr); g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; break; }
                 }
             }
             if (gba_wap_is_response(gba_wap_cmd(hdr))) {
@@ -1007,6 +1026,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     g_wake_words++;
                     if (w1 == 0x80000000u) g_wake_armed++;
                     if (w2 == (0x99660080u | (wake & 0xFFu))) g_wake_acks++;   /* 0x996600A8 / ..A7 */
+                    if (!g_pw_done) { g_pw_n = 0; g_pw_t0 = ccount(); g_pw_arm = 1; }  /* Phase 0 arm */
                 }
 #else  /* !CONFIG_GBA_SPI_WAKE_WORD — RESTORED idle-word path (2026-09-11). This is the
         * best-observed behaviour on hardware: the GBA plays the trade-room entry animation

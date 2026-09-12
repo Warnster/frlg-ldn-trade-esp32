@@ -144,6 +144,11 @@ bool ldn_pico_get_gba_identity(uint16_t *tid, uint8_t name8[8])
     return gba_relay_get_gba_identity(tid, name8);
 }
 
+bool ldn_pico_get_gba_compat(uint8_t *version, uint8_t *language)
+{
+    return gba_relay_get_gba_compat(version, language);
+}
+
 bool ldn_pico_get_gba_activity(uint8_t *activity, uint8_t *started, uint16_t *trade_word)
 {
     gba_relay_room_info_t ri;

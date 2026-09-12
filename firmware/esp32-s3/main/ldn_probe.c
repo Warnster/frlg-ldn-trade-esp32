@@ -1101,7 +1101,7 @@ static void run_private_join(void)
                 }
                 printf("CMD_HIST b16=%u host19=%u acc1a=%u bcS1c=%u bcP1d=%u bcE1e=%u conn1f=%u snd25=%u"
                        " | POST-CONNECT isConn20=%u finish21=%u recv26=%u recvW27=%u recvR28=%u chg35=%u last=0x%02x clkmaster=%u"
-                       " wake=%u armed=%u wacks=%u wto=%u abort=%u hsfb=%u ackrx=%08x hdrrx=%08x ni=%u/%u/%u c24=%u lk=%u/%u/%u/%u/%u rst=%08x@%u rsq=%u chw=%04x\n",
+                       " wake=%u armed=%u wacks=%u wto=%u abort=%u hsfb=%u ackrx=%08x hdrrx=%08x ni=%u/%u/%u/%u c24=%u lk=%u/%u/%u/%u/%u rst=%08x@%u/%u rsq=%u chw=%04x\n",
                        (unsigned)ldn_pico_cmd_count(0x16), (unsigned)ldn_pico_cmd_count(0x19),
                        (unsigned)ldn_pico_cmd_count(0x1a), (unsigned)ldn_pico_cmd_count(0x1c),
                        (unsigned)ldn_pico_cmd_count(0x1d), (unsigned)ldn_pico_cmd_count(0x1e),
@@ -1114,9 +1114,24 @@ static void run_private_join(void)
                        (unsigned)g_wake_timeouts, (unsigned)g_wait_aborts, (unsigned)g_hs_fallbacks,
                        (unsigned)g_parent_ack_last, (unsigned)g_parent_hdr_rx,
                        (unsigned)gba_relay_ni_stage(), (unsigned)gba_relay_ni_acks(), (unsigned)gba_relay_ni_childf(),
+                       (unsigned)gba_relay_ni_child_acks_sent(),
                        (unsigned)gba_relay_cmd_count(0x24),
                        (unsigned)g_gba_logins, (unsigned)g_gba_resets, (unsigned)g_cmd_resyncs,
-                       (unsigned)g_word_resyncs, (unsigned)g_gba_skips, (unsigned)g_gba_last_reset, (unsigned)g_reset_cmd, (unsigned)g_hdr_rescues, (unsigned)gba_relay_ni_lasthw());
+                       (unsigned)g_word_resyncs, (unsigned)g_gba_skips, (unsigned)g_gba_last_reset, (unsigned)g_reset_cmd, (unsigned)g_reset_wake_count, (unsigned)g_hdr_rescues, (unsigned)gba_relay_ni_lasthw());
+                /* docs/26 Phase 0: the raw words the GBA clocked at us right after the FIRST wake,
+                 * with ccount-since-wake. A 0x9966xx26-shaped word here = the GBA DID send
+                 * RECV_DATA and we mis-sampled it (handback bug, Phase A). All 0x80000000/idle/
+                 * junk = the GBA never issued 0x26 (wake content/sequence wrong). Printed once. */
+                static bool pw_printed = false;
+                if (g_pw_done && !pw_printed) {
+                    pw_printed = true;
+                    char pw[640]; int po = 0;
+                    po += snprintf(pw, sizeof(pw), "POSTWAKE n=%u (word @cycles-since-wake):", (unsigned)g_pw_n);
+                    for (uint32_t k = 0; k < g_pw_n && po < (int)sizeof(pw) - 32; k++)
+                        po += snprintf(pw + po, sizeof(pw) - po, " %08x@%u",
+                                       (unsigned)g_pw_rx[k], (unsigned)g_pw_dt[k]);
+                    printf("%s\n", pw);
+                }
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);
                 printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",

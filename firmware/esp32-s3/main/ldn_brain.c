@@ -92,6 +92,17 @@ int ldn_brain_start(const uint8_t ssid[16], const uint8_t our_ip[4], const uint8
             memcpy(s_engine.lp_name_raw, gname8, 8);
             s_engine.lp_name_raw_valid = 1;
             s_engine.lp_language = NI_LANGUAGE_JAPANESE;
+            /* Present the cart's REAL game version + language (from its broadcast compat field),
+             * not a hardcoded default. sim.c defaulted version to 5 (LeafGreen); a FireRed cart
+             * then got JOIN_GROUP_NO(6) from the Switch. Emerald=3/FireRed=4/LeafGreen=5. */
+            {
+                uint8_t gver = 0, glang = 0;
+                if (ldn_pico_get_gba_compat(&gver, &glang) && gver) {
+                    s_engine.lp_version_low = gver;
+                    if (glang) s_engine.lp_language = glang;
+                    printf("LDN_BRAIN compat version=%u language=%u (from cart broadcast)\n", gver, glang);
+                }
+            }
             printf("LDN_BRAIN identity tid=0x%04x name_raw=%02x%02x%02x%02x%02x%02x%02x%02x (JP, raw)\n",
                    gtid, gname8[0], gname8[1], gname8[2], gname8[3],
                    gname8[4], gname8[5], gname8[6], gname8[7]);

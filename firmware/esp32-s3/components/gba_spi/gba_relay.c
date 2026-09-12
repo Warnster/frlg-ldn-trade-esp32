@@ -52,6 +52,8 @@ typedef struct {
      * joining player instead of the hardcoded "EMU". */
     uint16_t         gba_id_tid;
     uint8_t          gba_id_name[8];
+    uint8_t          gba_id_version;   /* gGameVersion from the cart's broadcast: 3=Em 4=FR 5=LG */
+    uint8_t          gba_id_language;  /* compat low nibble: 1=JP 2=EN ... */
     _Atomic uint32_t gba_id_seen;
     _Atomic uint32_t cmd_hist[256];   /* per-command-byte count — full visibility into what flow the
                                        * GBA is in (host 0x19/0x1a vs browse 0x1c/1d/1e vs trade 0x25). */
@@ -135,17 +137,36 @@ static const ni_subframe_t s_ni_seq[5] = {
 };
 /* core1-owned NI progress (written in put_slot/take_frame, both core1) + core0-readable diags */
 static volatile uint32_t s_ni_stage;        /* 0..4 = serving s_ni_seq[stage]; >=5 = NI done -> UNI */
-static volatile uint32_t s_ni_acks;         /* child acks consumed */
-static volatile uint32_t s_ni_child_frames; /* child LLSF subframes seen in its sends */
+static volatile uint32_t s_ni_acks;         /* child acks consumed (of OUR outgoing status stream) */
+static volatile uint32_t s_ni_child_frames; /* child LLSF subframes seen in its sends (any kind) */
 static volatile uint32_t s_ni_null_served;  /* how many times the terminal NULL went out */
 static volatile uint32_t s_ni_last_hw;      /* raw halfword of the LAST child LLSF subframe seen */
+
+/* ---- child's OWN incoming NI stream (its identity/game-data) — the RECEIVE half, ported from
+ * pokeldn ni.py ParentNIReceiver/recv_ack_slot (2026-09-12). Everything above this comment only
+ * ever SENDS our own join-status stream and watches for the child's ACK of it (ack=1 subframes).
+ * But the child *also* sends its own NI subframes the OTHER direction (ack=0 — new data, not an
+ * ack), and per pokeldn: "the child must ack every host NI sub-frame or the host faults the link"
+ * — symmetrically, the HOST (us) must ack every CHILD subframe or the CHILD faults. We never did,
+ * which lines up exactly with hardware: every observed crash lands at "wake #2" — the GBA's very
+ * first SendDataWait, i.e. the first time it sends its OWN NI subframe and gets no ack for it.
+ * Fix: track the latest not-yet-acked child subframe; gba_relay_take_parent_frame serves an
+ * ack-only reply for it (state/n/phase mirrored, ack=1, size=0 — pokeldn parent_recv_ack_slot)
+ * with PRIORITY over our own outgoing status stream, every round, for as long as one is pending. */
+static volatile uint8_t  s_child_ack_state, s_child_ack_n, s_child_ack_phase;
+static volatile bool     s_child_ack_pending;
+static volatile uint32_t s_child_acks_sent;   /* replies sent for the child's own subframes */
 
 uint32_t gba_relay_ni_stage(void)  { return s_ni_stage; }
 uint32_t gba_relay_ni_acks(void)   { return s_ni_acks; }
 uint32_t gba_relay_ni_childf(void) { return s_ni_child_frames; }
 uint32_t gba_relay_ni_lasthw(void) { return s_ni_last_hw; }
+uint32_t gba_relay_ni_child_acks_sent(void) { return s_child_acks_sent; }
 
-static inline void ni_reset(void) { s_ni_stage = 0; s_ni_acks = 0; s_ni_null_served = 0; }
+static inline void ni_reset(void) {
+    s_ni_stage = 0; s_ni_acks = 0; s_ni_null_served = 0;
+    s_child_ack_pending = false;
+}
 
 /* Emit the current NI subframe (3-byte parent LLSF + payload) into b; returns byte count. */
 static IRAM_ATTR int ni_emit_current(uint8_t *b)
@@ -162,12 +183,30 @@ static IRAM_ATTR int ni_emit_current(uint8_t *b)
     return 3 + f->size;
 }
 
-/* Scan a child send (0x24/0x25 payload words) for child LLSF subframes and advance the NI machine
- * on a matching ack. Child LLSF halfword (pokeldn rfu.py child fields, LE):
- *   size:5 (b0-4) | phase:2 (b5-6) | n:2 (b7-8) | ack:1 (b9) | state:4 (b10-13) */
+/* Ack-only reply for one of the CHILD's own subframes — pokeldn parent_recv_ack_slot: mirror its
+ * (state, n, phase) with our ack=1, size=0, no payload. Same 3-byte parent LLSF shape as
+ * ni_emit_current, just with the ack bit set and nothing to send. */
+static IRAM_ATTR int ni_emit_child_ack(uint8_t *b, uint8_t state, uint8_t n, uint8_t phase)
+{
+    uint32_t llsf = ((uint32_t)(state & 0xF) << 14) | ((uint32_t)1 << 13) /* ack=1 */
+                  | ((uint32_t)(n & 3) << 11) | ((uint32_t)(phase & 3) << 9)
+                  | ((uint32_t)1 << 18) /* bmSlot=1 */;                    /* size=0 */
+    b[0] = (uint8_t)llsf; b[1] = (uint8_t)(llsf >> 8); b[2] = (uint8_t)(llsf >> 16);
+    return 3;
+}
+
+/* Scan a child send (0x24/0x25 payload words) for child LLSF subframes. Two directions share the
+ * wire: subframes with ack=1 are the child ACKING one of OUR outgoing status subframes (advances
+ * ni_stage, as before); subframes with ack=0 are the child SENDING us its OWN new NI data (its
+ * identity/game-data stream) — pokeldn ParentNIReceiver — which we must ack every time or the
+ * child's own librfu faults the link (rfu_STC_NI_receive). NULL is never acked (terminal, matches
+ * pokeldn: state==LCOM_NULL sets complete but returns no ack). Child LLSF halfword (pokeldn rfu.py
+ * child fields, LE): size:5 (b0-4) | phase:2 (b5-6) | n:2 (b7-8) | ack:1 (b9) | state:4 (b10-13).
+ * Runs regardless of ni_stage — acking the child's stream is a standing duty, not tied to whether
+ * OUR OWN status stream has finished. */
 static IRAM_ATTR void ni_scan_child(const uint32_t *data, int len)
 {
-    if (s_ni_stage >= 5 || len <= 0) return;
+    if (len <= 0) return;
     const uint8_t *p = (const uint8_t *)data;
     int nbytes = len * 4;
     int off = 0;
@@ -182,11 +221,16 @@ static IRAM_ATTR void ni_scan_child(const uint32_t *data, int len)
         s_ni_child_frames++;
         s_ni_last_hw = h;
         if (ack) {
-            const ni_subframe_t *cur = &s_ni_seq[s_ni_stage];
-            if (state == cur->state && n == cur->n && phase == cur->phase) {
-                s_ni_acks++;
-                if (s_ni_stage < 4) s_ni_stage++;          /* NULL advances via ni_emit_current */
+            if (s_ni_stage < 5) {
+                const ni_subframe_t *cur = &s_ni_seq[s_ni_stage];
+                if (state == cur->state && n == cur->n && phase == cur->phase) {
+                    s_ni_acks++;
+                    if (s_ni_stage < 4) s_ni_stage++;      /* NULL advances via ni_emit_current */
+                }
             }
+        } else if (state == NI_LCOM_START || state == NI_LCOM_NI || state == NI_LCOM_END) {
+            s_child_ack_state = state; s_child_ack_n = n; s_child_ack_phase = phase;
+            s_child_ack_pending = true;
         }
         off += 2 + size;
     }
@@ -229,7 +273,17 @@ static IRAM_ATTR void gba_relay_on_raw_command_cb(uint8_t cmd, const uint32_t *d
         for (int i = n; i < 6; i++) s_relay.broadcast_raw[i] = 0;
         atomic_store_explicit(&s_relay.broadcast_activity, act, memory_order_relaxed);
         atomic_fetch_add_explicit(&s_relay.broadcast_seen, 1, memory_order_release);
-        /* Capture the GBA's own in-game identity (TID + trainer name) from the same RfuGameData. */
+        /* Capture the GBA's own in-game identity (TID + trainer name) from the same RfuGameData.
+         * data[0] = serialNo(low16=0x0002) | compat(high16); compat = language | (version<<10)
+         * (pokeldn ni.py build_game_data; pokefirered link_rfu.h). version: Emerald=3, FireRed=4,
+         * LeafGreen=5 — so NEVER hardcode it (the cart can be any of the three). Extracting the
+         * cart's REAL compat is what makes the Switch host accept the join (JOIN_GROUP_OK=5 vs the
+         * JOIN_GROUP_NO=6 we got when we defaulted to LeafGreen). */
+        if (len >= 1) {
+            uint16_t compat = (uint16_t)(data[0] >> 16);
+            s_relay.gba_id_version  = (uint8_t)((compat >> 10) & 0xF);
+            s_relay.gba_id_language = (uint8_t)(compat & 0xF);
+        }
         if (len >= 6) {
             s_relay.gba_id_tid = (uint16_t)(data[1] & 0xFFFFu);
             s_relay.gba_id_name[0] = (uint8_t)(data[4]);       s_relay.gba_id_name[1] = (uint8_t)(data[4] >> 8);
@@ -372,7 +426,23 @@ uint32_t IRAM_ATTR gba_relay_wait_timeout_us(void)
 int IRAM_ATTR gba_relay_take_parent_frame(uint32_t *out, int max_words)
 {
     if (max_words < 1) return 0;
-    /* NI PHASE FIRST (see the sender above): until the child has acked the whole join-status NI
+    /* TOP PRIORITY: ack the child's own pending NI subframe (its identity/game-data stream) before
+     * anything else — pokeldn ParentNIReceiver's contract is "ack every child subframe or the
+     * child faults the link." This is the fix for the crash that landed at "wake #2" every time:
+     * the child's first SendDataWait carries its own NI data, and we never acked it. One ack per
+     * round is enough — the child re-sends the same subframe until it sees this, matching pokeldn's
+     * "the host can lose one and re-ack its predecessor forever" retransmit design. */
+    if (s_child_ack_pending) {
+        s_child_ack_pending = false;
+        uint8_t b[3];
+        int nb = ni_emit_child_ack(b, s_child_ack_state, s_child_ack_n, s_child_ack_phase);
+        out[0] = (uint32_t)nb & 0x7Fu;
+        if (max_words > 1)
+            out[1] = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
+        s_child_acks_sent++;
+        return (max_words > 1) ? 2 : 1;
+    }
+    /* NI PHASE (see the sender above): until the child has acked the whole join-status NI
      * sequence, every parent frame carries the current NI subframe — this is what moves the GBA
      * out of RFUSTATE_CHILD_TRY_JOIN. Only after that do we stream UNI frames. */
     if (s_ni_stage < 5) {
@@ -408,6 +478,14 @@ bool gba_relay_get_gba_identity(uint16_t *tid, uint8_t name8[8])
     if (!atomic_load_explicit(&s_relay.gba_id_seen, memory_order_acquire)) return false;
     if (tid) *tid = s_relay.gba_id_tid;
     if (name8) for (int i = 0; i < 8; i++) name8[i] = s_relay.gba_id_name[i];
+    return true;
+}
+
+bool gba_relay_get_gba_compat(uint8_t *version, uint8_t *language)
+{
+    if (!atomic_load_explicit(&s_relay.gba_id_seen, memory_order_acquire)) return false;
+    if (version)  *version  = s_relay.gba_id_version;
+    if (language) *language = s_relay.gba_id_language;
     return true;
 }
 

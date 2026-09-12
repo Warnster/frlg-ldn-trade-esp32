@@ -97,6 +97,11 @@ uint32_t gba_relay_cmd_count(uint8_t cmd);   /* per-command-byte count (full flo
  * the joining player instead of the hardcoded "EMU". */
 bool gba_relay_get_gba_identity(uint16_t *tid, uint8_t name8[8]);
 
+/* The cart's game version (3=Emerald 4=FireRed 5=LeafGreen) + language, decoded from the compat
+ * field of its Broadcast(0x16). The Switch host rejects the join (JOIN_GROUP_NO) unless the version
+ * we present matches the real cart — so NEVER hardcode it. Returns false until the GBA broadcasts. */
+bool gba_relay_get_gba_compat(uint8_t *version, uint8_t *language);
+
 /* Build the PARENT UNI sub-frame (3-byte parent LLSF + 70-byte gRecvCmds table: row0 = the
  * Switch's slot, row1 = the GBA's own slot echoed back). Returns the word count written (19 for a
  * full frame). Call from core1; IRAM-safe. The GBA pulls this via ReceiveData(0x26) after a
@@ -110,6 +115,10 @@ uint32_t gba_relay_ni_stage(void);
 uint32_t gba_relay_ni_acks(void);
 uint32_t gba_relay_ni_childf(void);
 uint32_t gba_relay_ni_lasthw(void);   /* raw halfword of last child LLSF subframe (decode check) */
+/* Replies sent acking the CHILD's own incoming NI subframes (its identity/game-data stream) —
+ * the pokeldn ParentNIReceiver half. If this stays 0 while ni_childf climbs, the child is sending
+ * data we're still not acking. */
+uint32_t gba_relay_ni_child_acks_sent(void);
 
 /* ---- core1-side data-phase helpers (docs/22 wake-word model) ----
  * fresh():        peek-only — has core0 published a Switch slot not yet consumed? The clock-master
