@@ -104,6 +104,26 @@ extern volatile uint32_t g_wake_timeouts, g_wait_aborts, g_hs_fallbacks;
 #define GBA_PW_N 12
 extern volatile uint32_t g_pw_rx[GBA_PW_N], g_pw_dt[GBA_PW_N], g_pw_n, g_pw_t0;
 extern volatile uint8_t  g_pw_arm, g_pw_done;
+/* Same, retargeted at wake #2 specifically (every observed crash follows it) — see gba_spi.c. */
+#define GBA_PW2_N 24
+extern volatile uint32_t g_pw2_rx[GBA_PW2_N], g_pw2_dt[GBA_PW2_N], g_pw2_n, g_pw2_t0;
+extern volatile uint8_t  g_pw2_arm, g_pw2_done;
+extern volatile uint32_t g_pw2_gen;              /* bumped each re-arm — print every attempt */
+extern volatile uint32_t g_wakes_this_connect;   /* wake count since the last Connect */
+
+/* Full post-connect command trace: every command from Connect(0x1f) onward, complete data words
+ * (not abbreviated) + our full reply, up to PCT_N commands or a reset. See gba_spi.c. */
+#define PCT_N    48
+#define PCT_MAXW 24
+typedef struct {
+    uint8_t  cmd, size, action, rn;
+    uint32_t data[PCT_MAXW];
+    uint32_t reply[PCT_MAXW];
+} pct_entry_t;
+extern volatile pct_entry_t g_pct[PCT_N];
+extern volatile uint32_t g_pct_n;
+extern volatile bool     g_pct_arm, g_pct_done;
+extern volatile uint32_t g_pct_gen;   /* bumped each re-arm (every Connect) — print every attempt */
 extern volatile uint32_t g_parent_ack_last, g_parent_hdr_rx;  /* raw wake word-2 / word-1 readbacks */
 extern volatile uint32_t g_core1_alive;
 extern volatile uint32_t g_cp;   /* checkpoint — see gba_spi.c's declaration comment */

@@ -1132,6 +1132,41 @@ static void run_private_join(void)
                                        (unsigned)g_pw_rx[k], (unsigned)g_pw_dt[k]);
                     printf("%s\n", pw);
                 }
+                /* 2026-09-12: same idea, retargeted at wake #2 (every crash follows it) — re-prints
+                 * on every retry (g_pw2_gen), unlike the one-shot-ever POSTWAKE above. */
+                static uint32_t pw2_printed_gen = 0xFFFFFFFFu;
+                if (g_pw2_done && g_pw2_gen != pw2_printed_gen) {
+                    pw2_printed_gen = g_pw2_gen;
+                    char pw[1200]; int po = 0;
+                    po += snprintf(pw, sizeof(pw), "POSTWAKE2 (after wake #2) n=%u (word @cycles-since-wake):", (unsigned)g_pw2_n);
+                    for (uint32_t k = 0; k < g_pw2_n && po < (int)sizeof(pw) - 32; k++)
+                        po += snprintf(pw + po, sizeof(pw) - po, " %08x@%u",
+                                       (unsigned)g_pw2_rx[k], (unsigned)g_pw2_dt[k]);
+                    printf("%s\n", pw);
+                }
+                /* 2026-09-12: the FULL post-connect command trace — every command from Connect
+                 * onward, complete data words and our complete reply, no abbreviation. Re-prints on
+                 * every Connect attempt (g_pct_gen). This is the "see everything" dump. */
+                static uint32_t pct_printed_gen = 0xFFFFFFFFu;
+                if (g_pct_done && g_pct_gen != pct_printed_gen) {
+                    pct_printed_gen = g_pct_gen;
+                    printf("PCT_TRACE gen=%u n=%u (post-Connect, oldest first):\n",
+                           (unsigned)g_pct_gen, (unsigned)g_pct_n);
+                    for (uint32_t k = 0; k < g_pct_n; k++) {
+                        pct_entry_t e; memcpy(&e, (const void *)&g_pct[k], sizeof(e));
+                        char line[900]; int lo = 0;
+                        lo += snprintf(line, sizeof(line), "  [%u] cmd=0x%02x size=%u act=%s rn=%u data=[",
+                                       (unsigned)k, e.cmd, e.size, e.action ? "ASYNC" : "REPLY", e.rn);
+                        for (int i = 0; i < e.size && i < PCT_MAXW && lo < (int)sizeof(line) - 16; i++)
+                            lo += snprintf(line + lo, sizeof(line) - lo, "%08x ", (unsigned)e.data[i]);
+                        lo += snprintf(line + lo, sizeof(line) - lo, "] reply=[");
+                        int rshow = (!e.action) ? e.rn : 0;
+                        for (int i = 0; i < rshow && i < PCT_MAXW && lo < (int)sizeof(line) - 16; i++)
+                            lo += snprintf(line + lo, sizeof(line) - lo, "%08x ", (unsigned)e.reply[i]);
+                        snprintf(line + lo, sizeof(line) - lo, "]");
+                        printf("%s\n", line);
+                    }
+                }
                 /* what the Pico relay reports back: did our peer adverts arrive + commit there? */
                 uint32_t pd[3]; ldn_pico_diag(pd);
                 printf("PICO_RX rx_bytes=%u peer_commits=%u peer_present=%u\n",

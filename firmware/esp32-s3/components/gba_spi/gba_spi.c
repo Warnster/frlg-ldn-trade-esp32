@@ -169,12 +169,41 @@ volatile uint32_t g_wake_timeouts;        /* wakes sent as 0x99660027 (idle time
  * gba_spi.h. */
 volatile uint32_t g_pw_rx[GBA_PW_N], g_pw_dt[GBA_PW_N], g_pw_n, g_pw_t0;
 volatile uint8_t  g_pw_arm, g_pw_done;
+/* 2026-09-12: every observed crash follows WAKE #2 specifically (the child's first SendDataWait),
+ * and the original g_pw_* above is a one-shot that only ever armed on wake #1 — it never saw what
+ * happens after #2, which is exactly where the crash is. Same mechanism, retargeted: arms once
+ * g_wake_words reaches 2, captures more words (GBA_PW2_N) to reach further past it. */
+#define GBA_PW2_N 24
+volatile uint32_t g_pw2_rx[GBA_PW2_N], g_pw2_dt[GBA_PW2_N], g_pw2_n, g_pw2_t0;
+volatile uint8_t  g_pw2_arm, g_pw2_done;
+volatile uint32_t g_pw2_gen;    /* bumped each re-arm so core0 can print every attempt, not just #1 */
+volatile uint32_t g_wakes_this_connect;   /* wake count since the LAST Connect — g_wake_words is
+                                            * cumulative across the whole boot, so "==2" on it would
+                                            * only ever fire on the first-ever attempt; this resets
+                                            * at Connect so wake #2 is detected on every retry. */
 /* 2026-09-12: does a hard reset correlate with REPEATED wake/pin-mux cycles rather than the first
  * one? Captured alongside g_reset_cmd at every reset site: g_wake_words' value AT THE INSTANT of
  * the reset, so "reset happened after N wake cycles this boot" is directly readable (today's crash
  * landed at cmd118, well past the first wake at ~cmd101 — this makes that precise instead of
  * inferred from two separate CMD_HIST prints). */
 volatile uint32_t g_reset_wake_count;
+
+/* ---- FULL post-connect command trace (2026-09-12) --------------------------------------------
+ * Every crash so far lands at EXACTLY wake_count==2, inside 1ms of Connect, and every abbreviated
+ * ring/POSTWAKE view we've built has been too narrow or too early to see what's actually happening
+ * right around it (POSTWAKE only ever armed on the FIRST wake; the tagged trace ring only shows 2
+ * bytes of each NI subframe, not the GBA's full sent payload). This is the "stop guessing, see
+ * everything" instrument: from the moment Connect(0x1f) fires, record EVERY command in full —
+ * cmd, size, every data word the GBA sent (not just the first 2 bytes), and every word we replied
+ * with — for PCT_N commands or until a reset, whichever comes first. One-shot per connect (ni_reset
+ * -style re-arm), printed once by core0. This should be enough to see the GBA's actual SendDataWait
+ * payload, any commands after wake #2, and the exact command it sends immediately before dying.
+ * pct_entry_t/PCT_N/PCT_MAXW are declared in gba_spi.h (shared with the core0 printer). */
+volatile pct_entry_t g_pct[PCT_N];
+volatile uint32_t g_pct_n;      /* entries recorded so far, caps at PCT_N */
+volatile bool     g_pct_arm;    /* recording is live (armed by Connect, disarmed at PCT_N or a reset) */
+volatile bool     g_pct_done;   /* latched full/stopped — core0 prints once, then waits for re-arm */
+volatile uint32_t g_pct_gen;    /* bumped each re-arm so core0 can print every attempt, not just #1 */
 volatile uint32_t g_wait_aborts;          /* waits abandoned because the GBA re-took the clock (SC high) */
 volatile uint32_t g_hs_fallbacks;         /* inverted-handshake SO responses that never came (blind settle used) */
 volatile uint32_t g_parent_ack_last;      /* raw word-2 readback (expect 0x996600A8) — the diagnosis */
@@ -566,6 +595,12 @@ static IRAM_ATTR bool xfer_word(uint32_t tx, uint32_t *rx_word)
         g_pw_n++;
         if (g_pw_n >= GBA_PW_N) { g_pw_arm = 0; g_pw_done = 1; }
     }
+    if (g_pw2_arm && g_pw2_n < GBA_PW2_N) {        /* 2026-09-12: same, retargeted at wake #2 */
+        g_pw2_dt[g_pw2_n] = ccount() - g_pw2_t0;
+        g_pw2_rx[g_pw2_n] = rx;
+        g_pw2_n++;
+        if (g_pw2_n >= GBA_PW2_N) { g_pw2_arm = 0; g_pw2_done = 1; }
+    }
     if (rx_word) *rx_word = rx;
     return true;                                   /* SI left HIGH (idle) */
 }
@@ -827,7 +862,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                 g_gba_cmds++; g_gba_last_cmd = 0x26;
                 continue;
             }
-            if (!hok) { reset_snapshot(1); g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; break; }
+            if (!hok) { reset_snapshot(1); g_gba_resets++; g_gba_last_reset = 1; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; if (g_pct_arm) { g_pct_arm = false; g_pct_done = true; } if (g_pw2_arm) { g_pw2_arm = 0; g_pw2_done = 1; } break; }
             if (!gba_wap_header_valid(hdr)) {
                 /* 2026-09-10 fix, round 5: a sniffer capture caught the ACTUAL failure mode live —
                  * a single bit misread on the wire (0x9966001a -> 0x9d66001a, ONE bit different),
@@ -860,7 +895,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     uint32_t resynced = 0;
                     g_cp = 0x10;
                     if (cmd_resync(&resynced)) { g_cmd_resyncs++; hdr = resynced; cmd_trace_push('X', 0, hdr); }
-                    else { reset_snapshot(hdr); g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; break; }
+                    else { reset_snapshot(hdr); g_gba_resets++; g_gba_last_reset = hdr; g_reset_cmd = g_gba_cmds; g_reset_wake_count = g_wake_words; if (g_pct_arm) { g_pct_arm = false; g_pct_done = true; } if (g_pw2_arm) { g_pw2_arm = 0; g_pw2_done = 1; } break; }
                 }
             }
             if (gba_wap_is_response(gba_wap_cmd(hdr))) {
@@ -886,6 +921,19 @@ void IRAM_ATTR gba_spi_core1_entry(void)
             uint32_t out[24]; gba_wap_action act;
             int rn = gba_wap_respond(io, cmd, data, size, out, &act);
             g_gba_cmds++; g_gba_last_cmd = cmd;
+
+            /* PCT: (re)arm fresh on every Connect — each join attempt gets its own clean capture. */
+            if (cmd == GBA_CMD_CONNECT) { g_pct_n = 0; g_pct_arm = true; g_pct_done = false; g_pct_gen++; g_wakes_this_connect = 0; }
+            if (g_pct_arm && g_pct_n < PCT_N) {
+                volatile pct_entry_t *e = &g_pct[g_pct_n];
+                e->cmd = cmd; e->size = size; e->action = (uint8_t)act; e->rn = (uint8_t)rn;
+                for (int i = 0; i < PCT_MAXW; i++) {
+                    e->data[i]  = (i < size) ? data[i] : 0;
+                    e->reply[i] = (act == GBA_WAP_REPLY && i < rn) ? out[i] : 0;
+                }
+                g_pct_n++;
+                if (g_pct_n >= PCT_N) { g_pct_arm = false; g_pct_done = true; }
+            }
 
             uint32_t dummy;
             if (act == GBA_WAP_ASYNC_ACK) {
@@ -1023,10 +1071,11 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                     gba_spi_clock_master_release();  /* bit-bang path: release after the final gate */
 #endif
 #endif
-                    g_wake_words++;
+                    g_wake_words++; g_wakes_this_connect++;
                     if (w1 == 0x80000000u) g_wake_armed++;
                     if (w2 == (0x99660080u | (wake & 0xFFu))) g_wake_acks++;   /* 0x996600A8 / ..A7 */
                     if (!g_pw_done) { g_pw_n = 0; g_pw_t0 = ccount(); g_pw_arm = 1; }  /* Phase 0 arm */
+                    if (g_wakes_this_connect == 2 && !g_pw2_arm) { g_pw2_n = 0; g_pw2_t0 = ccount(); g_pw2_arm = 1; g_pw2_done = 0; g_pw2_gen++; }
                 }
 #else  /* !CONFIG_GBA_SPI_WAKE_WORD — RESTORED idle-word path (2026-09-11). This is the
         * best-observed behaviour on hardware: the GBA plays the trade-room entry animation
