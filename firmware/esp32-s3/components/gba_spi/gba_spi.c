@@ -8,7 +8,8 @@
  * bits, no CS. Pinned to core1; Wi-Fi/LDN stay on core0. See GBA_SPI_SLAVE_DESIGN.md. */
 #include "gba_spi.h"
 #include "gba_wap.h"
-#include "gba_relay.h"   /* slot-freshness peek + wait timeout for the clock-master wake (docs/22) */
+#include "gba_relay.h"
+#include "gba_spi_hwmaster.h"  /* GPSPI3 hardware clock for the data-phase wake (CONFIG_GBA_SPI_HW_MASTER) */   /* slot-freshness peek + wait timeout for the clock-master wake (docs/22) */
 #include <string.h>
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -601,17 +602,39 @@ static IRAM_ATTR bool wake_wait_so(bool want_high, uint32_t timeout_us)
     }
 }
 
-/* The full inter-word interlock. Returns false (and counts a fallback) if either GBA response
- * never came — we still settle and proceed, so a missed observation degrades to the old blind
- * pacing instead of wedging core1. */
-static IRAM_ATTR bool wake_handshake(void)
+/* The mirror of afska LinkRawWireless::reverseAcknowledge() — the GBA-side (slave) between-word
+ * interlock, executed here from the adapter (master) side. afska's GBA code, per word, does:
+ *     SO->LOW  (wait SI->LOW)  ->  SO->HIGH (wait SI->HIGH)  ->  wait >=40us  -> [if last] SO->LOW (wait SI->LOW)
+ * i.e. the GBA drives SO and spins until OUR SI reaches the matching level. So our job is the
+ * dual: watch the GBA's SO, and drive our SI to satisfy each wait, in this exact order:
+ *     wait SO==LOW  -> drive SI LOW
+ *     wait SO==HIGH -> drive SI HIGH
+ *     settle >=40us  (afska MICRO_WAIT — "VERY important to avoid desyncs")
+ *     [if last] wait SO==LOW -> drive SI LOW
+ * This replaces the earlier SI-leads/blind-phase guess that never armed the GBA (armed=0). Returns
+ * false (counts a fallback) if a SO transition never came; we still settle and proceed so a missed
+ * edge degrades gracefully instead of wedging core1. */
+/* PRE-word inverted-ACK dance — afska wireless_adapter.md "Inverted ACKs", numbered order, which
+ * runs BEFORE each adapter-clocked transfer (step 6 = "adapter starts a transfer"):
+ *   1. we (adapter) drive SI LOW
+ *   2. GBA answers SO HIGH
+ *   3. we drive SI HIGH
+ *   4. GBA drops SO LOW when ready  (then we wait >=40us — "or the adapter desyncs forever")
+ *   5. we drive SI LOW when ready
+ *   6. clock the 32-bit word
+ * HARDWARE-CONFIRMED 2026-09-11: with the GPSPI hardware clock, word-1 readback was constant SO
+ * HIGH (0xFFFFFFFF = GBA parked at step 2) and word-2 constant SO LOW (0x00000000 = GBA at step 4)
+ * — the GBA was armed and mid-dance while we clocked. The old code ran this dance AFTER the word;
+ * it must run BEFORE. */
+static IRAM_ATTR __attribute__((unused)) bool wake_pre_ack(void)
 {
     bool ok = true;
-    SI_LOW();
-    if (!wake_wait_so(true,  WAKE_HS_TIMEOUT_US)) ok = false;   /* GBA entered its slave ISR */
-    SI_HIGH();
-    if (!wake_wait_so(false, WAKE_HS_TIMEOUT_US)) ok = false;   /* GBA re-armed for the next word */
-    esp_rom_delay_us(WAKE_HS_SETTLE_US);
+    SI_LOW();                                                   /* 1 */
+    if (!wake_wait_so(true,  WAKE_HS_TIMEOUT_US)) ok = false;   /* 2: GBA SO high */
+    SI_HIGH();                                                  /* 3 */
+    if (!wake_wait_so(false, WAKE_HS_TIMEOUT_US)) ok = false;   /* 4: GBA SO low = ready */
+    esp_rom_delay_us(WAKE_HS_SETTLE_US);                        /* >=40us settle */
+    SI_LOW();                                                   /* 5: we are ready */
     if (!ok) g_hs_fallbacks++;
     return ok;
 }
@@ -795,6 +818,7 @@ void IRAM_ATTR gba_spi_core1_entry(void)
             uint32_t dummy;
             if (act == GBA_WAP_ASYNC_ACK) {
 #if CONFIG_GBA_SPI_CLOCK_MASTER
+#if CONFIG_GBA_SPI_WAKE_WORD
                 /* ---- data-phase wait-then-wake (docs/22) --------------------------------------
                  * Correct model (afska wireless_adapter.md "Waiting", cross-checked against
                  * librfu_intr.c): the adapter NEVER pushes the payload as clock master. The whole
@@ -814,60 +838,135 @@ void IRAM_ATTR gba_spi_core1_entry(void)
                 xfer_word(tx1, &dummy); cmd_trace_push('a', tx1, dummy);
                 g_clock_master_swaps++;
 
-                /* 2. Let the GBA finish ARMING slave mode. Its master ISR is now parked in
-                 *    handshake_wait(0) waiting for our SI to go LOW (librfu_intr.c:104) and only
-                 *    then runs the state-3 block that loads SIODATA32=0x80000000 and enables the
-                 *    externally-clocked SIO (:119-123) — dropping its SO in the same breath. The
-                 *    old code never made this SI-low edge, so the GBA was likely never armed at
-                 *    all when we clocked at it (hdrrx=0xffc00000 = SO still idle-high). */
+                /* 2. ARM the GBA's slave mode — decomp-exact (librfu_intr.c, end of the master ISR
+                 *    that processed our A7 ack): the GBA runs handshake_wait(1) [our SI HIGH — true,
+                 *    we idle high] then handshake_wait(0) [our SI LOW — THIS edge], and only then
+                 *    STWI_stop_timer_in_RAM() + msMode=AGB_CLK_SLAVE + SIODATA32=0x80000000 +
+                 *    SIO_ENABLE. Two consequences: (a) without a prompt SI-LOW the GBA's STWI timer
+                 *    expires DURING any wait -> error -> the crash observed on hardware; (b) after
+                 *    this edge the timer is STOPPED, so the wait below is safe. The GBA's SO now
+                 *    presents the MSB of its loaded 0x80000000 — SO high is the passive "armed"
+                 *    tell. (The earlier engineer's arming SI-low was correct; afska's "Inverted
+                 *    ACKs" prose uses the adapter-side line names and misled the last rewrite.) */
                 g_cp = 4;
-                SI_LOW();
-                if (!wake_wait_so(false, WAKE_HS_TIMEOUT_US)) g_hs_fallbacks++;
+                /* RACE FIX (cycle-counted from the decomp, 2026-09-11): the GBA's ISR takes
+                 * ~15-40us (IRQ + BIOS + crt0 dispatcher + SerialIntr + IntrSIO32 + timer setup)
+                 * to reach handshake_wait(1) [SI HIGH], then handshake_wait(0) [SI LOW -> arm].
+                 * Our old code finished the whole high->low in <3us — 10x faster than the
+                 * listener; every gate was withdrawn before the GBA sampled it. Hold each level
+                 * >=1ms: dispatch path is 15-40us, but a mid-run VBlank/VCount handler can delay
+                 * ISR arrival by 100s of us; once ARRIVED the GBA waits up to 80ms (its STWI
+                 * timer), so long holds are free. 1ms = worst-case-proof at 1.25%% of budget. */
+                esp_rom_delay_us(1000);               /* SI is HIGH from the ack tail — HOLD for hw1 */
+                SI_LOW();                            /* arming edge — GBA stops its timer + arms */
 
-                /* 3. WAIT while the GBA is clock-slave and silent: wake as soon as core0 relays a
-                 *    fresh Switch slot, or after the Setup(0x17) idle timeout with "nothing new".
-                 *    Escape hatch: SC held high means the GBA gave up and restored clock-master
-                 *    itself (its SC is tristated while slave — our pulldown keeps it low), so skip
-                 *    the wake and fall back to the command loop. */
-                bool fresh = false, aborted = false;
+                /* 3. GATE ON THE ARMED TELL, THEN WAKE PROMPTLY (gpSP's design, translated to
+                 *    wire observables — hardware run 01:08 killed the long blind wait: hdrrx=0
+                 *    showed the GBA de-armed again during a 500ms hold; its game layer will not
+                 *    stay slave that long). When the GBA arms it loads SIODATA32=0x80000000 with
+                 *    SIO_ENABLE, so its SO rises to the MSB — THE armed signal, visible to us.
+                 *    So: watch SO for the rise (<=50ms — covers ISR arrival incl. VBlank tail);
+                 *    once armed, wake IMMEDIATELY: 0x28 if a fresh Switch slot is already
+                 *    relayed, else 0x27 ("nothing yet") — the game then simply re-issues WAIT,
+                 *    giving a tight poll loop instead of one long fragile hold. */
+                bool fresh = false, so_armed = false;
                 {
                     uint32_t t0 = ccount();
-                    uint32_t budget = gba_relay_wait_timeout_us() * 240u;
-                    uint32_t sc_high_run = 0;
+                    const uint32_t arm_budget = 50000u * 240u;          /* 50ms for the SO rise */
+                    uint32_t run = 0;
                     for (;;) {
-                        if (gba_relay_switch_slot_fresh()) { fresh = true; break; }
-                        if ((uint32_t)(ccount() - t0) > budget) break;
-                        if (CLK_HIGH()) {
-                            if (++sc_high_run >= 64) { aborted = true; break; }   /* ~sustained high */
-                        } else sc_high_run = 0;
+                        if (SO_HIGH()) { if (++run >= LINK_DEBOUNCE) { so_armed = true; break; } }
+                        else run = 0;
+                        if ((uint32_t)(ccount() - t0) > arm_budget) break;
                     }
+                    fresh = gba_relay_switch_slot_fresh();
                 }
-                if (aborted) {
-                    g_wait_aborts++;
-                    SI_HIGH();                       /* idle level for the next slave-mode word */
-                } else {
-                    /* 4. The 2-word wake, us clocking, with the SO-polled inverted handshake
-                     *    between words. Word-1 readback 0x80000000 proves the GBA was armed;
-                     *    word-2 TX must be exactly 0x80000000 (state 7 accepts nothing else,
-                     *    librfu_intr.c:265) and reads back the GBA's 0x996600A8 ack. */
+                if (!so_armed) g_wait_aborts++;                          /* 'abort' now = never armed */
+                {
+                    /* 4. Become master and clock the 2-word wake, mirroring afska
+                     *    receiveCommandFromAdapter + reverseAcknowledge (and gpSP's 2-word push):
+                     *      word0 = 0x99660028 (data ready) / 0x99660027 (idle timeout)
+                     *      -> reverse_ack(false)
+                     *      word1 = 0x80000000  (reads back the GBA's ack 0x996600A8 / ..A7)
+                     *      -> reverse_ack(last=true)   [still master, before handing SC back]
+                     *    word0 readback == 0x80000000 proves the GBA was slave-armed (armed++). */
+                    /* ALWAYS 0x28 (data ready): a real parent has a UNI frame from the first
+                     * WAIT onward, and hardware run 01:13 proved an instant 0x27 wake makes the
+                     * game quit ("partner has nothing" as its first answer -> Bye). The 0x26
+                     * reply now always carries the parent frame (zeros until Switch data flows).
+                     * wto now counts wakes sent with no fresh Switch slot (diagnostic only). */
                     uint32_t wake = gba_wap_header(0x28, 0);            /* 0x99660028 */
-                    if (!fresh) { wake = gba_wap_header(0x27, 0); g_wake_timeouts++; }
-                    esp_rom_delay_us(WAKE_HS_SETTLE_US);                /* post-arm settle */
+                    if (!fresh) g_wake_timeouts++;
                     gba_spi_clock_master_acquire();
                     g_cp = 0x30;
+                    esp_rom_delay_us(WAKE_HS_SETTLE_US);                /* let the GBA settle in slave */
+                    /* Per the decomp there is NO SO dance — the slave GBA's SO just presents its
+                     * loaded word's MSB. The whole per-word interlock is OUR SI level, gating its
+                     * per-word ISR (librfu_intr.c sio32intr_clock_slave):
+                     *   ISR entry:  handshake_wait(0) — SI LOW  (both wake words END in a 0 bit ✓)
+                     *   ISR exit:   handshake_wait(1) — SI HIGH — then it re-arms SIO for the next
+                     * So: word -> SI HIGH (let the ISR finish + re-arm) -> brief delay -> next word
+                     * (whose MSB=1 puts SI high anyway). After the LAST word the same SI-HIGH edge
+                     * lets state 8 run, which restores the GBA to clock-master. */
+#if CONFIG_GBA_SPI_HW_MASTER
+                    gba_spi_hwmaster_pins_take();
+                    gba_spi_hwmaster_si_spi();
+                    uint32_t w1 = gba_spi_hwmaster_xfer_word(wake);      /* rx 0x80000000 = armed */
+                    g_parent_hdr_rx = w1;
+                    cmd_trace_push('W', wake, w1);
+                    gba_spi_hwmaster_si_gpio();                          /* latch = LOW (arming) */
+                    esp_rom_delay_us(1000);                               /* ISR ENTRY gate: SI LOW, held */
+                    SI_HIGH();                                           /* ISR EXIT gate */
+                    esp_rom_delay_us(1000);                               /* held long enough to be seen */
+                    gba_spi_hwmaster_si_spi();
+                    uint32_t w2 = gba_spi_hwmaster_xfer_word(0x80000000u);  /* rx 0x996600A8/A7 */
+                    g_parent_ack_last = w2;
+                    cmd_trace_push('K', 0x80000000u, w2);
+                    gba_spi_hwmaster_si_gpio();                          /* latch = LOW */
+                    esp_rom_delay_us(1000);                               /* final ISR entry gate */
+                    SI_HIGH();                                           /* state 8 -> GBA restores master */
+                    /* NO trailing hold: the instant the GBA leaves state 8 its game fires the
+                     * follow-up ReceiveData(0x26) AT US as master — run 01:17 proved a leftover
+                     * 1ms epilogue left us deaf to it (wacks=1 but recv26=0 -> GBA gave up, Bye,
+                     * restarted its session). Restore pins + release + get back to the slave
+                     * command loop within microseconds. */
+                    gba_spi_hwmaster_pins_give();
+#else
                     uint32_t w1 = gba_spi_master_xfer_word(wake);
                     g_parent_hdr_rx = w1;
                     cmd_trace_push('W', wake, w1);
-                    wake_handshake();
+                    SI_LOW();  esp_rom_delay_us(1000);
+                    SI_HIGH(); esp_rom_delay_us(1000);
                     uint32_t w2 = gba_spi_master_xfer_word(0x80000000u);
                     g_parent_ack_last = w2;
                     cmd_trace_push('K', 0x80000000u, w2);
-                    gba_spi_clock_master_release();  /* before the GBA re-drives SC as master */
-                    wake_handshake();                /* closing interlock; GBA restores master after it */
+                    SI_LOW();  esp_rom_delay_us(1000);
+                    SI_HIGH();
+#endif
+                    gba_spi_clock_master_release();  /* GBA restores clock-master, then pulls via 0x26 */
                     g_wake_words++;
                     if (w1 == 0x80000000u) g_wake_armed++;
                     if (w2 == (0x99660080u | (wake & 0xFFu))) g_wake_acks++;   /* 0x996600A8 / ..A7 */
                 }
+#else  /* !CONFIG_GBA_SPI_WAKE_WORD — RESTORED idle-word path (2026-09-11). This is the
+        * best-observed behaviour on hardware: the GBA plays the trade-room entry animation
+        * before dropping at ~1s. The docs/22 wake-word model above is compiled-available via
+        * CONFIG_GBA_SPI_WAKE_WORD but has never armed the GBA on hardware (armed=0, hdrrx!=
+        * 0x80000000) across three attempts. Model: correct A7 ack (flips the GBA to clock-slave),
+        * then take the clock for exactly ONE idle word so its slave-side handshake completes, then
+        * hand SC straight back. Touch the clock as little as possible — extra master words
+        * destabilise it. */
+                uint32_t tx1 = gba_wap_response_header(gba_wap_header(cmd, 0));
+                g_cp = 3;
+                xfer_word(tx1, &dummy); cmd_trace_push('a', tx1, dummy);
+                g_clock_master_swaps++;
+                gba_spi_clock_master_acquire();
+                g_cp = 4;
+                uint32_t w1 = gba_spi_master_xfer_word(IDLE_WORD);
+                g_parent_hdr_rx = w1;
+                cmd_trace_push('i', IDLE_WORD, w1);
+                gba_spi_clock_master_release();
+#endif /* CONFIG_GBA_SPI_WAKE_WORD */
 #else
                 uint32_t tx1 = gba_wap_header(0xa8, 0);
                 g_cp = 3;

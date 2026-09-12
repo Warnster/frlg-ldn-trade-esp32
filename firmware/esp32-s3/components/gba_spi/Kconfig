@@ -55,3 +55,24 @@ config GBA_SPI_MODE
         or garbled, try 0. This is the first go/no-go dial.
 
 endmenu
+
+config GBA_SPI_WAKE_WORD
+    bool "Data phase: docs/22 2-word wake notification (unproven, default off)"
+    depends on GBA_SPI_CLOCK_MASTER
+    default n
+    help
+      y = the docs/22 wait-then-wake model (correct ack, SI-low arming edge, wait, 2-word
+      wake with SO-polled inverted handshake, payload via 0x26). Never armed the GBA on
+      hardware (armed=0) as of 2026-09-11. n = restored idle-word path: one idle word after
+      the A7 ack, then hand back the clock — best-observed behaviour (trade-room entry
+      animation before dropping ~1s).
+
+config GBA_SPI_HW_MASTER
+    bool "Data phase: clock the wake with the GPSPI3 hardware SPI peripheral"
+    depends on GBA_SPI_CLOCK_MASTER && GBA_SPI_WAKE_WORD
+    default y
+    help
+      Generate the 2-word wake's clock in the GPSPI3 silicon (mode 3, 256 kHz, full
+      duplex) instead of bit-banged CPU edges. Bit-banged master edges never got a
+      response from the GBA (armed=0); hardware SPI is the proven approach
+      (Shyri/gba-bt-hid drives a real GBA this way). n = legacy bit-bang master.

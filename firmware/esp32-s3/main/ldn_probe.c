@@ -24,7 +24,8 @@
 #include "ldn_brain.h"
 #include "ldn_control.h"
 #include "ldn_pico.h"
-#include "gba_spi.h"   /* experimental single-chip GBA-direct SPI-slave front-end (CONFIG_GBA_SPI_*) */
+#include "gba_spi.h"
+#include "gba_spi_hwmaster.h"   /* experimental single-chip GBA-direct SPI-slave front-end (CONFIG_GBA_SPI_*) */
 #if CONFIG_LDN_GBA_SINGLE_CHIP
 #include "gba_relay.h" /* single-chip: the core1<->core0 relay backing ldn_gba.c (docs/16 Phase 2) */
 #endif
@@ -1233,6 +1234,12 @@ void app_main(void)
     {
         static gba_wap_io s_gba_io;
         gba_spi_init();
+#if CONFIG_GBA_SPI_HW_MASTER
+        /* AFTER gba_spi_init (which owns the pad muxes) and BEFORE core1 starts: configure GPSPI3
+         * + latch its mode-3 idle-high CLK while the CLK/MOSI signals are still unrouted, and route
+         * the SO pad into SPI3_Q_IN (input selectors coexist with the dedic-GPIO bundle). */
+        gba_spi_hwmaster_init();
+#endif
         gba_relay_init();
         gba_relay_fill_io(&s_gba_io);
         gba_spi_set_core1_io(&s_gba_io);

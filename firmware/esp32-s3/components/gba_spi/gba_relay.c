@@ -279,12 +279,11 @@ uint32_t IRAM_ATTR gba_relay_wait_timeout_us(void)
 int IRAM_ATTR gba_relay_take_parent_frame(uint32_t *out, int max_words)
 {
     if (max_words < 1) return 0;
-    uint32_t seq = atomic_load_explicit(&s_relay.switch_slot_seq, memory_order_acquire);
-    if (seq == s_relay.switch_slot_seq_seen) {
-        out[0] = 0;
-        return 1;
-    }
-    s_relay.switch_slot_seq_seen = seq;
+    /* A REAL parent streams its UNI frame every frame from the moment the child connects — a
+     * zero gRecvCmds table means "parent alive, no commands yet", NOT "no data". The old
+     * count=0 reply told the game its partner had nothing, and the game (correctly) Bye'd.
+     * Always serve the full frame; still consume the mailbox seq so freshness tracking works. */
+    s_relay.switch_slot_seq_seen = atomic_load_explicit(&s_relay.switch_slot_seq, memory_order_acquire);
     out[0] = (RFU_PARENT_FRAME_SIZE + RFU_COMM_TABLE_LENGTH) & 0x7Fu;   /* 73 bytes from host */
     return 1 + gba_relay_build_parent_frame(out + 1, max_words - 1);
 }
